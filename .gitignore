@@ -1,0 +1,8 @@
+runtime/
+build/
+dist/
+_page_text.txt
+_preview_q1.png
+.venv/
+__pycache__/
+*.pyc

@@ -1,6 +1,6 @@
 """读取作业文本，调用 OpenAI 兼容接口作答，并在已打开的浏览器里选择答案。
 
-只做选择、勾选和填空。不会点击提交、交卷或暂时保存。
+只做选择、勾选、填空和简答。不会点击提交、交卷或暂时保存。
 """
 
 from __future__ import annotations
@@ -21,10 +21,8 @@ RUNTIME = ROOT / "runtime"
 PAGE_TEXT = ROOT / "_page_text.txt"
 ANSWERS_PATH = RUNTIME / "answers.json"
 
-QUESTION_RE = re.compile(
-    r"(?m)^(\d+)\. \((单选题|多选题|判断题|填空题)\)\n(.*?)(?=^\d+\. \((?:单选题|多选题|判断题|填空题)\)|\Z)",
-    re.S,
-)
+QUESTION_HEAD_RE = re.compile(r"(?m)^(\d+)\.\s*\(([^)\n]*题)\)\s*(.*)$")
+SECTION_RE = re.compile(r"(?m)^[一二三四五六七八九十]+\.\s*\S*题（[^）]*）\s*$")
 OPTION_RE = re.compile(r"(?m)^([A-H])\n(.*?)(?=\n[A-H]\n|\Z)", re.S)
 FORBIDDEN_NAMES = ("提交", "交卷", "暂时保存", "保存并提交", "确认提交")
 
@@ -33,6 +31,7 @@ TYPE_MAP = {
     "多选题": "multi",
     "判断题": "judge",
     "填空题": "blank",
+    "简答题": "essay",
 }
 
 
@@ -45,19 +44,41 @@ def load_page_text(path: Path) -> str:
     return text.strip() + "\n"
 
 
-def parse_questions(text: str) -> list[dict]:
+def describe_skipped(skipped: list[tuple[int, str]]) -> str:
+    if not skipped:
+        return ""
+    grouped: dict[str, list[str]] = {}
+    for number, raw_type in skipped:
+        grouped.setdefault(raw_type, []).append(str(number))
+    parts = [f"{name}（第 {'、'.join(numbers)} 题）" for name, numbers in grouped.items()]
+    return "已跳过未支持的题型：" + "；".join(parts)
+
+
+def parse_questions(text: str) -> tuple[list[dict], list[tuple[int, str]]]:
+    heads = list(QUESTION_HEAD_RE.finditer(text))
+    if not heads:
+        raise ValueError("没有解析到题目")
     questions: list[dict] = []
-    for match in QUESTION_RE.finditer(text):
-        number = int(match.group(1))
-        raw_type = match.group(2)
-        body = match.group(3).strip("\n")
-        kind = TYPE_MAP[raw_type]
+    skipped: list[tuple[int, str]] = []
+    for index, head in enumerate(heads):
+        number = int(head.group(1))
+        raw_type = head.group(2).strip()
+        end = heads[index + 1].start() if index + 1 < len(heads) else len(text)
+        body = f"{head.group(3)}\n{text[head.end() : end]}".strip("\n")
+        kind = TYPE_MAP.get(raw_type)
+        if kind is None:
+            skipped.append((number, raw_type))
+            continue
         if kind == "blank":
             labels = re.findall(r"(?m)^第(\d+)空\s*$", body)
             stem = re.sub(r"(?m)^第\d+空\s*$\n?", "", body)
-            stem = re.sub(r"(?m)^[一二三四五六七八九十]+\.\s*\S*题（[^）]*）\s*$", "", stem).strip()
+            stem = SECTION_RE.sub("", stem).strip()
             blanks = len(labels) or max(len(re.findall(r"_{3,}|＿{3,}", stem)), 1)
             options: dict[str, str] = {}
+        elif kind == "essay":
+            stem = SECTION_RE.sub("", body).strip()
+            blanks = 1
+            options = {}
         else:
             option_match = re.search(r"(?m)^[A-H]\n", body)
             if not option_match:
@@ -66,7 +87,8 @@ def parse_questions(text: str) -> list[dict]:
             options = {}
             for opt in OPTION_RE.finditer(body[option_match.start() :]):
                 letter = opt.group(1)
-                content = re.sub(r"\n{2,}", "\n", opt.group(2).strip())
+                content = SECTION_RE.sub("", opt.group(2))
+                content = re.sub(r"\n{2,}", "\n", content.strip())
                 options[letter] = content
             if not options:
                 raise ValueError(f"第 {number} 题选项为空")
@@ -77,14 +99,17 @@ def parse_questions(text: str) -> list[dict]:
                 "raw_type": raw_type,
                 "stem": stem,
                 "options": options,
-                "blanks": blanks if kind == "blank" else 1,
+                "blanks": blanks if kind in {"blank", "essay"} else 1,
             }
         )
+    if not questions:
+        detail = describe_skipped(skipped) or "没有可作答的题目"
+        raise ValueError(detail)
     questions.sort(key=lambda item: item["no"])
     numbers = [item["no"] for item in questions]
-    if numbers != list(range(1, len(questions) + 1)):
-        raise ValueError(f"题号不连续: {numbers}")
-    return questions
+    if len(numbers) != len(set(numbers)):
+        raise ValueError(f"题号重复: {numbers}")
+    return questions, skipped
 
 
 def openai_config(override: dict | None = None) -> tuple[str, str, str]:
@@ -156,6 +181,12 @@ def normalize_answer(question: dict, raw: str | list) -> str | list:
         if not parts or any(len(part) > 200 for part in parts):
             raise ValueError(f"第 {question['no']} 题填空答案异常: {raw!r}")
         return parts[0] if count <= 1 else parts
+    if kind == "essay":
+        text = str(raw).strip().strip('"').strip("“”")
+        text = re.sub(r"^(答|答案)\s*[:：]\s*", "", text).strip()
+        if not text or len(text) > 800:
+            raise ValueError(f"第 {question['no']} 题简答答案异常: {raw!r}")
+        return text
     value = str(raw).strip()
     if kind == "judge":
         truth = desired_truth(value, question["options"])
@@ -202,6 +233,7 @@ def solve_questions(questions: list[dict], config: dict | None = None, log=print
                     "填空题有多个空时，value 必须是数组，每个空一项，按空的顺序排列。"
                     "不要用逗号、分号、竖线或换行把多个空拼成一个字符串，答案内容里可以包含这些符号。"
                     "每个空只写该空的内容，不要解释。"
+                    "简答题的 value 是一段直接回答题干的文字，300字以内，不要写题号，不要加“答：”。"
                     "代码题要按题目语言判断能否编译，并在能运行时追踪输出。"
                     "只输出一个 JSON 对象，格式为 "
                     '{"answers":[{"no":1,"value":"B"}]}，不要输出其他文字。'
@@ -383,8 +415,13 @@ def apply_answers(
         if group is None:
             raise SystemExit(f"页面上没有第 {number} 题")
         scroll_into_view(group)
-        if record["type"] == "blank":
-            status = fill_blank(group, record["answer"], window)
+        if record["type"] in {"blank", "essay"}:
+            status = fill_blank(
+                group,
+                record["answer"],
+                window,
+                multiline=record["type"] == "essay",
+            )
         else:
             status = choose_option(group, record["type"], record["answer"], record.get("options") or {})
         line = {"no": number, "answer": record["answer"], "status": status}
@@ -455,7 +492,74 @@ def choose_option(group, kind: str, answer: str, options: dict | None = None) ->
     return "partial-" + "".join(picked)
 
 
-def paste_into_editor(editor, answer: str, window) -> str:
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _answer_landed(actual: str | None, expected: str) -> bool:
+    wanted = _compact_text(expected)
+    if actual is None or not wanted:
+        return False
+    return wanted in _compact_text(actual)
+
+
+def _editor_text(editor) -> str | None:
+    try:
+        pattern = editor.GetTextPattern()
+        if pattern:
+            return pattern.DocumentRange.GetText(-1)
+    except Exception:
+        pass
+    try:
+        value = editor.GetValuePattern()
+        if value is not None:
+            return value.Value or ""
+    except Exception:
+        pass
+    return None
+
+
+def _focus_is_editor(focused, editor) -> bool:
+    """填空获得光标后，Chrome 仍把焦点报成整页文档「作业作答」。
+
+    只要该焦点的区域包含编辑区中心，就说明刚才点中的是这道题。
+    地址栏不包含编辑区中心，不会被当成编辑区。
+    """
+    if focused is None or focused.ControlTypeName not in {"DocumentControl", "EditControl"}:
+        return False
+    editor_rect = editor.BoundingRectangle
+    focused_rect = focused.BoundingRectangle
+    if editor_rect.isempty() or focused_rect.isempty():
+        return False
+    if focused_rect.contains(editor_rect.xcenter(), editor_rect.ycenter()):
+        if focused.ControlTypeName == "EditControl":
+            overlap = editor_rect.intersect(focused_rect)
+            if overlap.width() < 8 or overlap.height() < 8:
+                return False
+        return True
+    try:
+        return tuple(focused.GetRuntimeId() or []) == tuple(editor.GetRuntimeId() or [])
+    except Exception:
+        return False
+
+
+def _dismiss_paste_block() -> None:
+    import uiautomation as auto
+
+    current = auto.GetFocusedControl()
+    texts = []
+    for _ in range(6):
+        if current is None:
+            break
+        texts.append(current.Name or "")
+        current = current.GetParentControl()
+    blob = "\n".join(texts)
+    if not any(phrase in blob for phrase in ("不允许粘贴", "禁止粘贴", "不能粘贴", "无法粘贴")):
+        return
+    auto.SendKeys("{Esc}", waitTime=0.12, charMode=False)
+
+
+def _focus_editor(editor, window) -> str | None:
     import uiautomation as auto
 
     bounds = window.BoundingRectangle
@@ -464,34 +568,128 @@ def paste_into_editor(editor, answer: str, window) -> str:
         scroll_into_view(editor)
         time.sleep(0.12)
         rect = editor.BoundingRectangle
-        if bounds.top + 70 <= rect.ycenter() <= bounds.bottom - 20:
+        if (
+            bounds.contains(rect.xcenter(), rect.ycenter())
+            and bounds.top + 70 <= rect.ycenter() <= bounds.bottom - 20
+        ):
             break
     else:
         return "offscreen"
     auto.Click(rect.xcenter(), rect.ycenter(), waitTime=0.2)
-    focused = auto.GetFocusedControl()
-    if focused is None or focused.ControlTypeName != "DocumentControl":
+    if _focus_is_editor(auto.GetFocusedControl(), editor):
+        return None
+    try:
+        editor.SetFocus()
+    except Exception:
         return "focus-failed"
+    time.sleep(0.1)
+    if _focus_is_editor(auto.GetFocusedControl(), editor):
+        return None
+    return "focus-failed"
+
+
+def _clear_editor() -> None:
+    import uiautomation as auto
+
+    auto.SendKeys("{Ctrl}a", waitTime=0.05, charMode=False)
+    auto.SendKeys("{Back}", waitTime=0.08, charMode=False)
+
+
+def _type_answer(text: str, multiline: bool, interval: float) -> None:
+    import uiautomation as auto
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    for char in normalized:
+        if char == "\n":
+            if multiline:
+                auto.SendKeys("{Enter}", interval=0, waitTime=interval, charMode=False)
+            else:
+                auto.SendUnicodeChar(" ", True)
+                time.sleep(interval)
+            continue
+        if char == "\t":
+            char = " "
+        auto.SendUnicodeChar(char, True)
+        time.sleep(interval)
+
+
+def _selected_text(_window) -> str | None:
+    """编辑区没有值接口。全选复制才能读到文字，空编辑区返回空字符串。"""
+    import uiautomation as auto
+
+    sentinel = "\u2060"
+    auto.SetClipboardText(sentinel)
+    auto.SendKeys("{Ctrl}a", waitTime=0.06, charMode=False)
+    auto.SendKeys("{Ctrl}c", waitTime=0.12, charMode=False)
+    copied = auto.GetClipboardText()
+    if copied is None or copied == sentinel:
+        return ""
+    if len(copied) > 1500:
+        auto.SendKeys("{Right}", waitTime=0.02, charMode=False)
+        return None
+    return copied
+
+
+def _current_editor_text(editor, window) -> str | None:
+    direct = _editor_text(editor)
+    if direct:
+        return direct
+    return _selected_text(window)
+
+
+def _ensure_editor_focus(editor, window) -> str | None:
+    import uiautomation as auto
+
+    if _focus_is_editor(auto.GetFocusedControl(), editor):
+        return None
+    return _focus_editor(editor, window)
+
+
+def paste_into_editor(editor, answer: str, window, multiline: bool = False) -> str:
+    """先粘贴。页面禁止粘贴或粘贴没有写入时，改为逐字输入。"""
+    import uiautomation as auto
+
+    error = _focus_editor(editor, window)
+    if error:
+        return error
     auto.SetClipboardText(answer)
     auto.SendKeys("{Ctrl}a", waitTime=0.05, charMode=False)
-    auto.SendKeys("{Ctrl}v", waitTime=0.12, charMode=False)
-    return "filled"
+    auto.SendKeys("{Ctrl}v", waitTime=0.16, charMode=False)
+    _dismiss_paste_block()
+    error = _ensure_editor_focus(editor, window)
+    if error:
+        return error
+    if _answer_landed(_current_editor_text(editor, window), answer):
+        return "已粘贴"
+    _clear_editor()
+    for attempt, interval in enumerate((0.01, 0.02)):
+        _type_answer(answer, multiline, interval)
+        current = _current_editor_text(editor, window)
+        if _answer_landed(current, answer) or current is None:
+            return "逐字写入"
+        if attempt == 0:
+            _clear_editor()
+    return "写入未生效"
 
 
-def fill_blank(group, answer: str | list, window=None) -> str:
+def fill_blank(group, answer: str | list, window=None, multiline: bool = False) -> str:
     editors = blank_editors(group)
     if not editors or window is None:
         return "no-editor"
     parts = blank_parts(answer, len(editors))
     if not parts:
         return f"空位{len(editors)}与答案段数不符"
+    statuses = []
     for index, (editor, part) in enumerate(zip(editors, parts), start=1):
-        status = paste_into_editor(editor, part, window)
-        if status != "filled":
+        status = paste_into_editor(editor, part, window, multiline=multiline)
+        if status not in {"已粘贴", "逐字写入"}:
             return f"第{index}空{status}"
+        statuses.append(status)
     if len(editors) == 1:
-        return "filled"
-    return f"filled-{len(editors)}空"
+        return statuses[0]
+    if any(status == "逐字写入" for status in statuses):
+        return f"逐字写入-{len(editors)}空"
+    return f"已粘贴-{len(editors)}空"
 
 
 def verify_answers(
@@ -506,7 +704,7 @@ def verify_answers(
     for record in records:
         if only and record["no"] not in only:
             continue
-        if record["type"] == "blank":
+        if record["type"] in {"blank", "essay"}:
             continue
         group = groups.get(record["no"])
         if group is None:
@@ -538,7 +736,10 @@ def verify_answers(
 
 
 def command_parse(args: argparse.Namespace) -> None:
-    questions = parse_questions(load_page_text(args.page))
+    questions, skipped = parse_questions(load_page_text(args.page))
+    note = describe_skipped(skipped)
+    if note:
+        print(note)
     counts: dict[str, int] = {}
     for question in questions:
         counts[question["type"]] = counts.get(question["type"], 0) + 1
@@ -550,7 +751,10 @@ def command_parse(args: argparse.Namespace) -> None:
 
 
 def command_solve(args: argparse.Namespace) -> None:
-    questions = parse_questions(load_page_text(args.page))
+    questions, skipped = parse_questions(load_page_text(args.page))
+    note = describe_skipped(skipped)
+    if note:
+        print(note)
     records = solve_questions(questions, config_from_args(args))
     RUNTIME.mkdir(exist_ok=True)
     ANSWERS_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")

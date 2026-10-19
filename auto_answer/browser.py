@@ -95,25 +95,52 @@ def inspect_homework_window(handle: int, flash: bool = True) -> dict:
 
 
 def copy_page_text(handle: int) -> str:
-    """从指定作业窗口复制当前页题目文本。不会点击提交。"""
+    """从指定作业窗口复制当前页题目文本。不会点击提交。完成后回到原来的窗口。"""
     import uiautomation as auto
 
+    previous = _foreground_handle()
     window = window_from_handle(handle)
     if window is None:
         raise SystemExit("选中的窗口已经关闭，请重新刷新")
-    window.SetActive(waitTime=0.3)
-    name, _count = _page_summary(window)
-    _click_named_text(window, name)
-    document = window.DocumentControl(searchDepth=25, Name="作业作答")
-    if document.Exists(maxSearchSeconds=1):
-        document.SetFocus()
-    auto.SendKeys("{Ctrl}a", waitTime=0.25, charMode=False)
-    auto.SendKeys("{Ctrl}c", waitTime=0.4, charMode=False)
-    text = auto.GetClipboardText() or ""
-    _click_named_text(window, name)
-    if len(text.strip()) < 20:
-        raise SystemExit("没有从当前作业页复制到题目，请确认页面停留在作答界面")
-    return text
+    try:
+        window.SetActive(waitTime=0.3)
+        name, _count = _page_summary(window)
+        _click_named_text(window, name)
+        document = window.DocumentControl(searchDepth=25, Name="作业作答")
+        if document.Exists(maxSearchSeconds=1):
+            document.SetFocus()
+        auto.SendKeys("{Ctrl}a", waitTime=0.25, charMode=False)
+        auto.SendKeys("{Ctrl}c", waitTime=0.4, charMode=False)
+        text = auto.GetClipboardText() or ""
+        _click_named_text(window, name)
+        if len(text.strip()) < 20:
+            raise SystemExit("没有从当前作业页复制到题目，请确认页面停留在作答界面")
+        return text
+    finally:
+        _restore_foreground(previous)
+
+
+def _foreground_handle() -> int:
+    return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+
+
+def _restore_foreground(handle: int) -> None:
+    if not handle:
+        return
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    if _foreground_handle() == int(handle):
+        return
+    hwnd = wintypes.HWND(int(handle))
+    current = kernel32.GetCurrentThreadId()
+    foreign = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+    target = user32.GetWindowThreadProcessId(hwnd, None)
+    user32.AttachThreadInput(current, foreign, True)
+    user32.AttachThreadInput(current, target, True)
+    user32.ShowWindow(hwnd, 9)
+    user32.SetForegroundWindow(hwnd)
+    user32.AttachThreadInput(current, target, False)
+    user32.AttachThreadInput(current, foreign, False)
 
 
 def _click_named_text(window, name: str) -> None:

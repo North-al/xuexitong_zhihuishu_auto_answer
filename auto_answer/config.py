@@ -28,17 +28,12 @@ def icon_file() -> Path:
 ROOT = app_root()
 CONFIG_PATH = ROOT / "runtime" / "openai.json"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = ""
 PROVIDERS = {
-    "OpenAI": {
-        "base_url": "https://api.openai.com/v1",
-        "models": ("gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-4.1-mini", "o4-mini"),
-    },
-    "DeepSeek": {
-        "base_url": "https://api.deepseek.com",
-        "models": ("deepseek-chat", "deepseek-reasoner"),
-    },
+    "OpenAI": {"base_url": "https://api.openai.com/v1"},
+    "DeepSeek": {"base_url": "https://api.deepseek.com"},
 }
+PROVIDER_NAMES = ("OpenAI", "DeepSeek", "自定义")
 
 
 def provider_for(base_url: str) -> str:
@@ -50,26 +45,71 @@ def provider_for(base_url: str) -> str:
     return "自定义"
 
 
-def read_saved_config() -> dict:
+def _empty_profiles() -> dict:
+    return {
+        "OpenAI": {"api_key": "", "base_url": PROVIDERS["OpenAI"]["base_url"], "model": ""},
+        "DeepSeek": {"api_key": "", "base_url": PROVIDERS["DeepSeek"]["base_url"], "model": ""},
+        "自定义": {"api_key": "", "base_url": "", "model": ""},
+    }
+
+
+def _clean_profile(raw: dict, fallback: dict) -> dict:
+    base_url = str(raw.get("base_url") or fallback["base_url"]).strip().rstrip("/")
+    return {
+        "api_key": str(raw.get("api_key") or "").strip(),
+        "base_url": base_url,
+        "model": str(raw.get("model") or "").strip(),
+    }
+
+
+def load_store() -> dict:
+    """读取各接口各自的地址、密钥和模型。兼容以前只有一份配置的文件。"""
+    profiles = _empty_profiles()
     if not CONFIG_PATH.exists():
-        return {}
+        return {"provider": "OpenAI", "providers": profiles}
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return {}
+        return {"provider": "OpenAI", "providers": profiles}
     if not isinstance(data, dict):
-        return {}
-    return data
+        return {"provider": "OpenAI", "providers": profiles}
+    saved = data.get("providers")
+    if isinstance(saved, dict):
+        for name in profiles:
+            raw = saved.get(name)
+            if isinstance(raw, dict):
+                profiles[name] = _clean_profile(raw, profiles[name])
+        active = str(data.get("provider") or "")
+        if active not in profiles:
+            active = "自定义"
+        return {"provider": active, "providers": profiles}
+    if any(data.get(field) for field in ("api_key", "base_url", "model")):
+        name = provider_for(str(data.get("base_url") or ""))
+        profiles[name] = _clean_profile(data, profiles[name])
+        return {"provider": name, "providers": profiles}
+    return {"provider": "OpenAI", "providers": profiles}
+
+
+def save_store(provider: str, providers: dict) -> None:
+    CONFIG_PATH.parent.mkdir(exist_ok=True)
+    payload = {"provider": provider, "providers": providers}
+    CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_saved_config() -> dict:
+    store = load_store()
+    return store["providers"].get(store["provider"], {})
 
 
 def save_config(api_key: str, base_url: str, model: str) -> None:
-    CONFIG_PATH.parent.mkdir(exist_ok=True)
-    payload = {
-        "api_key": api_key.strip(),
-        "base_url": (base_url.strip() or DEFAULT_BASE_URL).rstrip("/"),
-        "model": model.strip() or DEFAULT_MODEL,
-    }
-    CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    store = load_store()
+    name = provider_for(base_url)
+    store["providers"][name] = _clean_profile(
+        {"api_key": api_key, "base_url": base_url, "model": model},
+        store["providers"][name],
+    )
+    store["provider"] = name
+    save_store(store["provider"], store["providers"])
 
 
 def resolve_config(override: dict | None = None) -> dict:

@@ -9,18 +9,19 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from auto_answer.browser import copy_page_text, describe_inspection, inspect_homework_window, list_homework_windows
-from auto_answer.config import PROVIDERS, icon_file, provider_for, resolve_config, save_config
+from auto_answer.config import PROVIDERS, icon_file, load_store, save_store
 from auto_answer.homework import (
     ANSWERS_PATH,
     PAGE_TEXT,
     apply_answers,
     load_page_text,
+    describe_skipped,
     parse_questions,
     solve_questions,
     verify_answers,
 )
 
-TYPE_LABEL = {"single": "单选", "multi": "多选", "judge": "判断", "blank": "填空"}
+TYPE_LABEL = {"single": "单选", "multi": "多选", "judge": "判断", "blank": "填空", "essay": "简答"}
 
 
 def show_answer(answer) -> str:
@@ -67,6 +68,8 @@ class App(tk.Tk):
         self.question_name = ""
         self.detected_work_id = ""
         self.detected_name = ""
+        self._profiles: dict = {}
+        self._active_provider = ""
         self._build_style()
         self._build()
         self._load_config_into_form()
@@ -201,8 +204,7 @@ class App(tk.Tk):
         self.provider.grid(row=0, column=1, sticky="ew", pady=4)
         self.provider.bind("<<ComboboxSelected>>", self._on_provider)
         self._field_label(form, "模型", 0, 2)
-        self.model_var = tk.StringVar()
-        self.model = ttk.Combobox(form, textvariable=self.model_var)
+        self.model = ttk.Entry(form)
         self.model.grid(row=0, column=3, sticky="ew", pady=4)
         self._field_label(form, "接口地址", 1, 0)
         self.base_url = ttk.Entry(form)
@@ -214,7 +216,7 @@ class App(tk.Tk):
         self.save_button.grid(row=2, column=3, sticky="e", padx=(12, 0))
         tk.Label(
             ai,
-            text="DeepSeek 选 deepseek-chat 或 deepseek-reasoner。也可以填其他 OpenAI 兼容地址和模型。",
+            text="切换服务会换上该服务已保存的地址、密钥和模型。模型请手动填写。",
             bg=CARD,
             fg=MUTED,
             anchor="w",
@@ -380,23 +382,43 @@ class App(tk.Tk):
                 label.configure(fg=INK_SOFT, font=("Microsoft YaHei UI", 10))
 
     def _load_config_into_form(self) -> None:
-        config = resolve_config()
-        self.base_url.insert(0, config["base_url"])
-        self.model_var.set(config["model"])
-        self.api_key.insert(0, config["api_key"])
-        provider = provider_for(config["base_url"])
-        self.provider_var.set(provider)
-        self.model.configure(values=PROVIDERS.get(provider, {}).get("models", ()))
+        store = load_store()
+        self._profiles = store["providers"]
+        self._active_provider = store["provider"]
+        self.provider_var.set(self._active_provider)
+        self._fill_profile(self._profiles[self._active_provider])
+
+    def _fill_profile(self, profile: dict) -> None:
+        self.base_url.delete(0, "end")
+        self.base_url.insert(0, profile.get("base_url") or "")
+        self.model.delete(0, "end")
+        self.model.insert(0, profile.get("model") or "")
+        self.api_key.delete(0, "end")
+        self.api_key.insert(0, profile.get("api_key") or "")
+
+    def _remember_profile(self) -> None:
+        if not self._active_provider:
+            return
+        profile = self.current_config()
+        preset = PROVIDERS.get(self._active_provider)
+        if preset and not profile["base_url"]:
+            profile["base_url"] = preset["base_url"]
+        self._profiles[self._active_provider] = profile
 
     def _on_provider(self, _event=None) -> None:
-        preset = PROVIDERS.get(self.provider_var.get())
-        if not preset:
-            self.model.configure(values=())
+        name = self.provider_var.get()
+        if not name or name == self._active_provider:
             return
-        self.base_url.delete(0, "end")
-        self.base_url.insert(0, preset["base_url"])
-        self.model.configure(values=preset["models"])
-        self.model_var.set(preset["models"][0])
+        self._remember_profile()
+        self._active_provider = name
+        profile = dict(self._profiles.get(name) or {})
+        preset = PROVIDERS.get(name)
+        if preset and not profile.get("base_url"):
+            profile["base_url"] = preset["base_url"]
+        self._profiles[name] = profile
+        self._fill_profile(profile)
+        save_store(self._active_provider, self._profiles)
+        self.write_log(f"已切换到{name}")
 
     def current_config(self) -> dict:
         return {
@@ -410,8 +432,9 @@ class App(tk.Tk):
         if not config["api_key"] or not config["base_url"] or not config["model"]:
             messagebox.showwarning("配置不完整", "请填写接口地址、模型和 API Key")
             return
-        save_config(config["api_key"], config["base_url"], config["model"])
-        self.write_log("配置已保存到 runtime/openai.json")
+        self._remember_profile()
+        save_store(self._active_provider, self._profiles)
+        self.write_log(f"已保存{self._active_provider}的配置")
 
     def refresh_windows(self) -> None:
         try:
@@ -480,7 +503,7 @@ class App(tk.Tk):
             return
         PAGE_TEXT.write_text(text, encoding="utf-8")
         try:
-            questions = parse_questions(load_page_text(PAGE_TEXT))
+            questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("题目解析失败", str(exc))
             return
@@ -494,6 +517,9 @@ class App(tk.Tk):
         self.question_name = self.detected_name or "剪贴板"
         self._refresh_question_banner()
         self.write_log(f"已从剪贴板解析 {len(questions)} 题，保存在 _page_text.txt")
+        note = describe_skipped(skipped)
+        if note:
+            self.write_log(note)
 
     def _load_saved_answers(self) -> None:
         if not ANSWERS_PATH.exists():
@@ -532,7 +558,7 @@ class App(tk.Tk):
                 raise SystemExit(info.get("message") or "没有读到当前窗口")
             text = copy_page_text(item["handle"])
             PAGE_TEXT.write_text(text, encoding="utf-8")
-            questions = parse_questions(load_page_text(PAGE_TEXT))
+            questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
             self.records = [
                 {
                     "no": question["no"],
@@ -551,6 +577,9 @@ class App(tk.Tk):
             self.events.put(("tree", None))
             self.events.put(("banner", None))
             self.events.put(("log", f"已更新题目：{self.question_name or '当前作业'}，共 {len(questions)} 题"))
+            note = describe_skipped(skipped)
+            if note:
+                self.events.put(("log", note))
 
         self._start("更新题目", work)
 
@@ -598,7 +627,10 @@ class App(tk.Tk):
             return
 
         def work() -> None:
-            questions = parse_questions(load_page_text(PAGE_TEXT))
+            questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
+            note = describe_skipped(skipped)
+            if note:
+                self.events.put(("log", note))
             solve_questions(
                 questions,
                 config,
@@ -653,11 +685,14 @@ class App(tk.Tk):
         scope = "全部题目" if not only else "指定题号"
 
         def work() -> None:
-            choice_count = sum(1 for record in records if record["type"] != "blank")
+            choice_count = sum(1 for record in records if record["type"] not in {"blank", "essay"})
             blank_count = sum(1 for record in records if record["type"] == "blank")
+            essay_count = sum(1 for record in records if record["type"] == "essay")
             mismatches = verify_answers(records, window_title=item["title"], window_handle=item["handle"], only=only)
             if blank_count:
                 self.events.put(("log", f"填空题 {blank_count} 题没有核对：页面上读不到已经填入的内容"))
+            if essay_count:
+                self.events.put(("log", f"简答题 {essay_count} 题没有核对：编辑区读不到已经写入的文字"))
             if not mismatches:
                 self.events.put(("log", f"已核对{scope}里的选择题 {choice_count} 题，与答案一致"))
                 return

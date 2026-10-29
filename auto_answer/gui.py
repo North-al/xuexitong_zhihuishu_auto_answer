@@ -17,6 +17,7 @@ from auto_answer.homework import (
     load_page_text,
     describe_skipped,
     parse_questions,
+    save_question_images,
     solve_questions,
     verify_answers,
 )
@@ -533,6 +534,8 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         for index, record in enumerate(self.records):
             stem = " ".join((record.get("stem") or "").split())
+            if record.get("images"):
+                stem = f"［图］{stem}"
             if not self.questions_current:
                 tag = "stale-alt" if index % 2 else "stale"
             elif index % 2:
@@ -559,6 +562,11 @@ class App(tk.Tk):
             text = copy_page_text(item["handle"])
             PAGE_TEXT.write_text(text, encoding="utf-8")
             questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
+            try:
+                images = save_question_images(item["handle"], questions)
+            except Exception as exc:  # noqa: BLE001
+                images = {}
+                self.events.put(("log", f"图片截取失败：{exc}"))
             self.records = [
                 {
                     "no": question["no"],
@@ -566,6 +574,7 @@ class App(tk.Tk):
                     "answer": "",
                     "stem": question["stem"],
                     "options": question["options"],
+                    "images": images.get(question["no"]) or [],
                 }
                 for question in questions
             ]
@@ -577,6 +586,10 @@ class App(tk.Tk):
             self.events.put(("tree", None))
             self.events.put(("banner", None))
             self.events.put(("log", f"已更新题目：{self.question_name or '当前作业'}，共 {len(questions)} 题"))
+            pictured = [number for number, paths in images.items() if paths]
+            if pictured:
+                numbers = "、".join(str(number) for number in pictured)
+                self.events.put(("log", f"第 {numbers} 题含图片，生成答案时会把截图发给模型"))
             note = describe_skipped(skipped)
             if note:
                 self.events.put(("log", note))

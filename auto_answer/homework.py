@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import time
@@ -20,8 +21,13 @@ ROOT = app_root()
 RUNTIME = ROOT / "runtime"
 PAGE_TEXT = ROOT / "_page_text.txt"
 ANSWERS_PATH = RUNTIME / "answers.json"
+IMAGES_PATH = RUNTIME / "images.json"
+IMAGE_DIR = RUNTIME / "images"
+IMAGE_UPLOAD_ANSWER = "需上传图片"
 
-QUESTION_HEAD_RE = re.compile(r"(?m)^(\d+)\.\s*\(([^)\n]*题)\)\s*(.*)$")
+QUESTION_HEAD_RE = re.compile(
+    r"(?m)^(\d+)\.\s*\(([^)\n]*题)(?:\s*[,，]\s*[\d.]+\s*分)?\)\s*(.*)$"
+)
 SECTION_RE = re.compile(r"(?m)^[一二三四五六七八九十]+\.\s*\S*题（[^）]*）\s*$")
 OPTION_RE = re.compile(r"(?m)^([A-H])\n(.*?)(?=\n[A-H]\n|\Z)", re.S)
 FORBIDDEN_NAMES = ("提交", "交卷", "暂时保存", "保存并提交", "确认提交")
@@ -175,6 +181,8 @@ def desired_truth(answer: str, options: dict | None = None) -> str:
 
 def normalize_answer(question: dict, raw: str | list) -> str | list:
     kind = question["type"]
+    if kind in {"blank", "essay"} and str(raw).strip() == IMAGE_UPLOAD_ANSWER:
+        return IMAGE_UPLOAD_ANSWER
     if kind == "blank":
         count = int(question.get("blanks") or 1)
         parts = blank_parts(raw, count)
@@ -204,56 +212,112 @@ def normalize_answer(question: dict, raw: str | list) -> str | list:
     return "".join(sorted(letters))
 
 
+def _text_has_image(question: dict) -> bool:
+    chunks = [question.get("stem") or ""]
+    chunks.extend((question.get("options") or {}).values())
+    return any("\uFFFC" in chunk for chunk in chunks)
+
+
+def _vision_rejected(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(word in text for word in ("image", "vision", "multimodal", "image_url", "图片"))
+
+
+def _payload_question(item: dict) -> dict:
+    stem = (item.get("stem") or "").replace("\uFFFC", "").strip()
+    options = {
+        letter: (text or "").replace("\uFFFC", "").strip()
+        for letter, text in (item.get("options") or {}).items()
+    }
+    if item.get("images"):
+        stem = f"{stem}\n（本题含图片，见附图）".strip()
+    entry = {
+        "no": item["no"],
+        "type": item["raw_type"],
+        "stem": stem,
+        "options": options,
+    }
+    if item["type"] == "blank":
+        entry["blanks"] = item.get("blanks") or 1
+    return entry
+
+
+def _image_part(path: str) -> dict:
+    encoded = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+    }
+
+
+def _user_content(batch: list[dict]) -> str | list[dict]:
+    payload = [_payload_question(item) for item in batch]
+    text = json.dumps({"questions": payload}, ensure_ascii=False)
+    images = [(item["no"], path) for item in batch for path in item.get("images") or []]
+    if not images:
+        return text
+    parts: list[dict] = [{"type": "text", "text": text}]
+    for number, path in images:
+        parts.append({"type": "text", "text": f"附图是第 {number} 题"})
+        parts.append(_image_part(path))
+    return parts
+
+
 def solve_questions(questions: list[dict], config: dict | None = None, log=print, on_update=None) -> list[dict]:
     api_key, base_url, model = openai_config(config)
+    attach_saved_images(questions)
+    for question in questions:
+        if _text_has_image(question) and not question.get("images"):
+            log(f"第 {question['no']} 题含图片，但没有截图。请重新点「更新题目」")
     solved: dict[int, str | list] = {}
-    batch_size = 10
-    for offset in range(0, len(questions), batch_size):
-        batch = questions[offset : offset + batch_size]
-        payload = []
-        for item in batch:
-            entry = {
-                "no": item["no"],
-                "type": item["raw_type"],
-                "stem": item["stem"],
-                "options": item["options"],
-            }
-            if item["type"] == "blank":
-                entry["blanks"] = item.get("blanks") or 1
-            payload.append(entry)
+    plain = [item for item in questions if not item.get("images")]
+    pictured = [item for item in questions if item.get("images")]
+    _solve_batches(questions, plain, 10, api_key, base_url, model, solved, log, on_update)
+    _solve_batches(questions, pictured, 1, api_key, base_url, model, solved, log, on_update)
+    return _answer_records(questions, solved)
+
+
+def _solve_batches(
+    questions: list[dict],
+    selected: list[dict],
+    batch_size: int,
+    api_key: str,
+    base_url: str,
+    model: str,
+    solved: dict[int, str | list],
+    log,
+    on_update,
+) -> None:
+    system = (
+        "你是课程测验阅卷助手。只根据题干、选项和附图作答。"
+        "单选题的 value 只能是一个大写字母。"
+        "多选题的 value 是所有正确选项字母按字母序连写，例如 AD。"
+        "判断题的 value 只能是「对」或「错」。选项顺序不固定，A 可能是对，也可能是错。"
+        "填空题只有一个空时，value 是字符串，只写应填入横线的内容。"
+        "填空题有多个空时，value 必须是数组，每个空一项，按空的顺序排列。"
+        "不要用逗号、分号、竖线或换行把多个空拼成一个字符串，答案内容里可以包含这些符号。"
+        "每个空只写该空的内容，不要解释。"
+        "简答题的 value 是一段直接回答题干的文字，300字以内，不要写题号，不要加“答：”。"
+        "如果题目要求上传或绘制图片作为答案，value 填「需上传图片」。"
+        "选项即使是图片，选择题也只返回字母。"
+        "代码题要按题目语言判断能否编译，并在能运行时追踪输出。"
+        "只输出一个 JSON 对象，格式为 "
+        '{"answers":[{"no":1,"value":"B"}]}，不要输出其他文字。'
+    )
+    for offset in range(0, len(selected), batch_size):
+        batch = selected[offset : offset + batch_size]
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是课程测验阅卷助手。只根据题干和选项作答。"
-                    "单选题的 value 只能是一个大写字母。"
-                    "多选题的 value 是所有正确选项字母按字母序连写，例如 AD。"
-                    "判断题的 value 只能是「对」或「错」。选项顺序不固定，A 可能是对，也可能是错。"
-                    "填空题只有一个空时，value 是字符串，只写应填入横线的内容。"
-                    "填空题有多个空时，value 必须是数组，每个空一项，按空的顺序排列。"
-                    "不要用逗号、分号、竖线或换行把多个空拼成一个字符串，答案内容里可以包含这些符号。"
-                    "每个空只写该空的内容，不要解释。"
-                    "简答题的 value 是一段直接回答题干的文字，300字以内，不要写题号，不要加“答：”。"
-                    "代码题要按题目语言判断能否编译，并在能运行时追踪输出。"
-                    "只输出一个 JSON 对象，格式为 "
-                    '{"answers":[{"no":1,"value":"B"}]}，不要输出其他文字。'
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps({"questions": payload}, ensure_ascii=False),
-            },
+            {"role": "system", "content": system},
+            {"role": "user", "content": _user_content(batch)},
         ]
         numbers = [item["no"] for item in batch]
-        log(f"正在请求 {model}: 第 {numbers[0]}-{numbers[-1]} 题")
+        label = f"第 {numbers[0]} 题" if numbers[0] == numbers[-1] else f"第 {numbers[0]}-{numbers[-1]} 题"
+        log(f"正在请求 {model}: {label}")
         last_error = None
         for _ in range(2):
             try:
                 result = chat_json(api_key, base_url, model, messages)
-                answers = result["answers"]
-                got = {}
-                for item in answers:
-                    got[int(item["no"])] = item["value"]
+                got = {int(item["no"]): item["value"] for item in result["answers"]}
                 for question in batch:
                     solved[question["no"]] = normalize_answer(question, got[question["no"]])
                 last_error = None
@@ -263,13 +327,17 @@ def solve_questions(questions: list[dict], config: dict | None = None, log=print
                 log(f"本批需要重试: {exc}")
                 time.sleep(1)
         if last_error:
-            raise SystemExit(f"第 {numbers[0]}-{numbers[-1]} 题作答失败: {last_error}")
+            if any(item.get("images") for item in batch) and _vision_rejected(last_error):
+                log(f"{label}的图片当前模型无法识别，请换用支持看图的模型")
+                for question in batch:
+                    solved[question["no"]] = ""
+            else:
+                raise SystemExit(f"{label}作答失败: {last_error}")
         current = _answer_records(questions, solved)
         RUNTIME.mkdir(exist_ok=True)
         ANSWERS_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
         if on_update:
             on_update(current)
-    return _answer_records(questions, solved)
 
 
 def _answer_records(questions: list[dict], solved: dict[int, str | list]) -> list[dict]:
@@ -280,6 +348,7 @@ def _answer_records(questions: list[dict], solved: dict[int, str | list]) -> lis
             "answer": solved.get(question["no"], ""),
             "stem": question["stem"],
             "options": question["options"],
+            "images": question.get("images") or [],
         }
         for question in questions
     ]
@@ -327,6 +396,133 @@ def collect_question_groups(window) -> dict[int, object]:
 
     walk(document, 0)
     return found
+
+
+def _in_toolbar(control) -> bool:
+    current = control
+    for _ in range(6):
+        if current is None:
+            return False
+        text = f"{current.ClassName or ''} {current.Name or ''}".lower()
+        if "toolbar" in text or "edui-editor-toolbar" in text:
+            return True
+        current = current.GetParentControl()
+    return False
+
+
+def _clip_box(rect, bounds) -> tuple[int, int, int, int] | None:
+    left = max(rect.left, bounds.left + 4)
+    top = max(rect.top, bounds.top + 80)
+    right = min(rect.right, bounds.right - 4)
+    bottom = min(rect.bottom, bounds.bottom - 8)
+    if right - left < 24 or bottom - top < 24:
+        return None
+    return (left, top, right, bottom)
+
+
+def _question_image_boxes(group, window, question: dict) -> list[tuple[int, int, int, int]]:
+    scroll_into_view(group)
+    time.sleep(0.12)
+    bounds = window.BoundingRectangle
+    boxes = []
+
+    def walk(control, depth: int) -> None:
+        if depth > 8:
+            return
+        rect = control.BoundingRectangle
+        if (
+            control.ControlTypeName == "ImageControl"
+            and not _in_toolbar(control)
+            and rect.width() >= 48
+            and rect.height() >= 48
+        ):
+            scroll_into_view(control)
+            time.sleep(0.08)
+            box = _clip_box(control.BoundingRectangle, bounds)
+            if box:
+                boxes.append(box)
+            return
+        for child in control.GetChildren():
+            walk(child, depth + 1)
+
+    walk(group, 0)
+    if boxes:
+        return boxes[:4]
+    if not _text_has_image(question):
+        return []
+    box = _clip_box(group.BoundingRectangle, bounds)
+    return [box] if box else []
+
+
+def _write_jpeg(box: tuple[int, int, int, int], dest: Path) -> None:
+    from PIL import Image, ImageGrab
+
+    image = ImageGrab.grab(bbox=box, all_screens=True).convert("RGB")
+    if image.width > 1280:
+        height = max(int(image.height * 1280 / image.width), 1)
+        image = image.resize((1280, height), Image.Resampling.LANCZOS)
+    if image.height > 1600:
+        width = max(int(image.width * 1600 / image.height), 1)
+        image = image.resize((width, 1600), Image.Resampling.LANCZOS)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    image.save(dest, "JPEG", quality=75)
+
+
+def save_question_images(handle: int, questions: list[dict]) -> dict[int, list[str]]:
+    """截下题干或选项里的图片。编辑器工具栏上的小图标不算。"""
+    import ctypes
+
+    from auto_answer.browser import _foreground_handle, _restore_foreground, window_from_handle
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    if IMAGE_DIR.exists():
+        for old in IMAGE_DIR.iterdir():
+            if old.is_file():
+                old.unlink()
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    RUNTIME.mkdir(exist_ok=True)
+    IMAGES_PATH.write_text("{}", encoding="utf-8")
+    previous = _foreground_handle()
+    saved: dict[str, list[str]] = {}
+    try:
+        window = window_from_handle(handle)
+        if window is None:
+            raise SystemExit("选中的窗口已经关闭，请重新刷新")
+        window.SetActive(waitTime=0.2)
+        groups = collect_question_groups(window)
+        for question in questions:
+            group = groups.get(question["no"])
+            if group is None:
+                continue
+            paths = []
+            for index, box in enumerate(_question_image_boxes(group, window, question), start=1):
+                name = f"{question['no']}-{index}.jpg"
+                _write_jpeg(box, IMAGE_DIR / name)
+                paths.append(f"images/{name}")
+            if paths:
+                saved[str(question["no"])] = paths
+    finally:
+        _restore_foreground(previous)
+    RUNTIME.mkdir(exist_ok=True)
+    IMAGES_PATH.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {int(number): paths for number, paths in saved.items()}
+
+
+def attach_saved_images(questions: list[dict]) -> None:
+    if not IMAGES_PATH.exists():
+        return
+    saved = json.loads(IMAGES_PATH.read_text(encoding="utf-8"))
+    for question in questions:
+        paths = []
+        for relative in saved.get(str(question["no"])) or []:
+            file = RUNTIME / relative
+            if file.exists():
+                paths.append(str(file))
+        if paths:
+            question["images"] = paths
 
 
 def choice_controls(group) -> list:
@@ -672,9 +868,31 @@ def paste_into_editor(editor, answer: str, window, multiline: bool = False) -> s
     return "写入未生效"
 
 
+def _group_needs_upload(group) -> bool:
+    found = False
+
+    def walk(control, depth: int) -> None:
+        nonlocal found
+        if found or depth > 8 or control is None:
+            return
+        name = control.Name or ""
+        if any(word in name for word in ("上传图片", "上传附件", "插入图片", "选择图片")):
+            found = True
+            return
+        for child in control.GetChildren():
+            walk(child, depth + 1)
+
+    walk(group, 0)
+    return found
+
+
 def fill_blank(group, answer: str | list, window=None, multiline: bool = False) -> str:
+    if str(answer).strip() == IMAGE_UPLOAD_ANSWER:
+        return IMAGE_UPLOAD_ANSWER
     editors = blank_editors(group)
     if not editors or window is None:
+        if group is not None and _group_needs_upload(group):
+            return IMAGE_UPLOAD_ANSWER
         return "no-editor"
     parts = blank_parts(answer, len(editors))
     if not parts:

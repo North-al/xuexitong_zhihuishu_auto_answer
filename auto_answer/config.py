@@ -62,17 +62,27 @@ def _clean_profile(raw: dict, fallback: dict) -> dict:
     }
 
 
+def _pick_verify_provider(active: str, saved: str = "") -> str:
+    name = str(saved or "").strip()
+    if name in PROVIDER_NAMES:
+        return name
+    for candidate in PROVIDER_NAMES:
+        if candidate != active:
+            return candidate
+    return active
+
+
 def load_store() -> dict:
     """读取各接口各自的地址、密钥和模型。兼容以前只有一份配置的文件。"""
     profiles = _empty_profiles()
     if not CONFIG_PATH.exists():
-        return {"provider": "OpenAI", "providers": profiles}
+        return {"provider": "OpenAI", "verify_provider": "DeepSeek", "providers": profiles}
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return {"provider": "OpenAI", "providers": profiles}
+        return {"provider": "OpenAI", "verify_provider": "DeepSeek", "providers": profiles}
     if not isinstance(data, dict):
-        return {"provider": "OpenAI", "providers": profiles}
+        return {"provider": "OpenAI", "verify_provider": "DeepSeek", "providers": profiles}
     saved = data.get("providers")
     if isinstance(saved, dict):
         for name in profiles:
@@ -82,17 +92,31 @@ def load_store() -> dict:
         active = str(data.get("provider") or "")
         if active not in profiles:
             active = "自定义"
-        return {"provider": active, "providers": profiles}
+        return {
+            "provider": active,
+            "verify_provider": _pick_verify_provider(active, str(data.get("verify_provider") or "")),
+            "providers": profiles,
+        }
     if any(data.get(field) for field in ("api_key", "base_url", "model")):
         name = provider_for(str(data.get("base_url") or ""))
         profiles[name] = _clean_profile(data, profiles[name])
-        return {"provider": name, "providers": profiles}
-    return {"provider": "OpenAI", "providers": profiles}
+        return {
+            "provider": name,
+            "verify_provider": _pick_verify_provider(name),
+            "providers": profiles,
+        }
+    return {"provider": "OpenAI", "verify_provider": "DeepSeek", "providers": profiles}
 
 
-def save_store(provider: str, providers: dict) -> None:
+def save_store(provider: str, providers: dict, verify_provider: str | None = None) -> None:
     CONFIG_PATH.parent.mkdir(exist_ok=True)
-    payload = {"provider": provider, "providers": providers}
+    previous = load_store()
+    chosen = verify_provider if verify_provider is not None else previous.get("verify_provider")
+    payload = {
+        "provider": provider,
+        "verify_provider": _pick_verify_provider(provider, str(chosen or "")),
+        "providers": providers,
+    }
     CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

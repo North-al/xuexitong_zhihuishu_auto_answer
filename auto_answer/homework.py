@@ -30,6 +30,11 @@ QUESTION_HEAD_RE = re.compile(
 )
 SECTION_RE = re.compile(r"(?m)^[一二三四五六七八九十]+\.\s*\S*题（[^）]*）\s*$")
 OPTION_RE = re.compile(r"(?m)^([A-H])\n(.*?)(?=\n[A-H]\n|\Z)", re.S)
+# 写入后再更新题目时，页面会带上「我的答案」，必须丢掉，否则模型会跟着旧答案走
+FILLED_ANSWER_RE = re.compile(
+    r"(?ms)^我的答案\s*[:：]?.*?(?=^\d+\.\s*\(|^[一二三四五六七八九十]+\.\s*\S*题|\Z)"
+)
+NAV_FOOTER_RE = re.compile(r"\n[一二三四五六七八九十]+\.\s*\S*题（[\d.]+分）")
 FORBIDDEN_NAMES = ("提交", "交卷", "暂时保存", "保存并提交", "确认提交")
 
 TYPE_MAP = {
@@ -44,10 +49,22 @@ TYPE_MAP = {
 def load_page_text(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    footers = list(re.finditer(r"\n一\. 单选题（\d+分）", text))
-    if footers:
-        text = text[: footers[-1].start()]
+    # 页脚导航是「一. 单选题（60.4分）」，题型标题是「一. 单选题（共14题，60.4分）」
+    # 从第一个页脚导航处截断，避免题号列表粘到最后一题
+    footer = NAV_FOOTER_RE.search(text)
+    if footer:
+        text = text[: footer.start()]
+    text = FILLED_ANSWER_RE.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip() + "\n"
+
+
+def _clean_question_text(text: str) -> str:
+    text = FILLED_ANSWER_RE.sub("", text or "")
+    text = re.sub(r"(?m)^我的答案\s*[:：]?.*$", "", text)
+    text = re.sub(r"(?m)^\d{5,}\s*$", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def describe_skipped(skipped: list[tuple[int, str]]) -> str:
@@ -70,7 +87,7 @@ def parse_questions(text: str) -> tuple[list[dict], list[tuple[int, str]]]:
         number = int(head.group(1))
         raw_type = head.group(2).strip()
         end = heads[index + 1].start() if index + 1 < len(heads) else len(text)
-        body = f"{head.group(3)}\n{text[head.end() : end]}".strip("\n")
+        body = _clean_question_text(f"{head.group(3)}\n{text[head.end() : end]}")
         kind = TYPE_MAP.get(raw_type)
         if kind is None:
             skipped.append((number, raw_type))
@@ -79,22 +96,24 @@ def parse_questions(text: str) -> tuple[list[dict], list[tuple[int, str]]]:
             labels = re.findall(r"(?m)^第(\d+)空\s*$", body)
             stem = re.sub(r"(?m)^第\d+空\s*$\n?", "", body)
             stem = SECTION_RE.sub("", stem).strip()
+            stem = _clean_question_text(stem)
             blanks = len(labels) or max(len(re.findall(r"_{3,}|＿{3,}", stem)), 1)
             options: dict[str, str] = {}
         elif kind == "essay":
-            stem = SECTION_RE.sub("", body).strip()
+            stem = _clean_question_text(SECTION_RE.sub("", body))
             blanks = 1
             options = {}
         else:
             option_match = re.search(r"(?m)^[A-H]\n", body)
             if not option_match:
                 raise ValueError(f"第 {number} 题没有解析到选项")
-            stem = body[: option_match.start()].strip()
+            stem = _clean_question_text(body[: option_match.start()])
             options = {}
             for opt in OPTION_RE.finditer(body[option_match.start() :]):
                 letter = opt.group(1)
                 content = SECTION_RE.sub("", opt.group(2))
-                content = re.sub(r"\n{2,}", "\n", content.strip())
+                content = _clean_question_text(content)
+                content = re.sub(r"\n{2,}", "\n", content)
                 options[letter] = content
             if not options:
                 raise ValueError(f"第 {number} 题选项为空")
@@ -125,6 +144,27 @@ def openai_config(override: dict | None = None) -> tuple[str, str, str]:
     return config["api_key"], config["base_url"], config["model"]
 
 
+def _message_text(message: dict) -> str:
+    """从 OpenAI 兼容的 message 里取出文本。模型名不限，只要返回结构兼容即可。"""
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+        content = "".join(parts)
+    text = str(content or "").strip()
+    if text:
+        return text
+    for key in ("reasoning_content", "reasoning", "output_text"):
+        extra = message.get(key)
+        if isinstance(extra, str) and extra.strip():
+            return extra.strip()
+    return ""
+
+
 def chat_json(api_key: str, base_url: str, model: str, messages: list[dict]) -> dict:
     payload: dict = {
         "model": model,
@@ -133,7 +173,7 @@ def chat_json(api_key: str, base_url: str, model: str, messages: list[dict]) -> 
     if "reasoner" not in model.lower():
         payload["temperature"] = 0
     request = urllib.request.Request(
-        f"{base_url}/chat/completions",
+        f"{base_url.rstrip('/')}/chat/completions",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -147,7 +187,11 @@ def chat_json(api_key: str, base_url: str, model: str, messages: list[dict]) -> 
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
         raise RuntimeError(f"接口调用失败 {exc.code}: {detail[:500]}") from exc
-    content = (data["choices"][0]["message"].get("content") or "").strip()
+    try:
+        message = data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"接口返回不是 OpenAI 兼容格式: {str(data)[:300]}") from exc
+    content = _message_text(message if isinstance(message, dict) else {})
     content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I)
     start = content.find("{")
     end = content.rfind("}")
@@ -263,7 +307,13 @@ def _user_content(batch: list[dict]) -> str | list[dict]:
     return parts
 
 
-def solve_questions(questions: list[dict], config: dict | None = None, log=print, on_update=None) -> list[dict]:
+def solve_questions(
+    questions: list[dict],
+    config: dict | None = None,
+    log=print,
+    on_update=None,
+    persist: bool = True,
+) -> list[dict]:
     api_key, base_url, model = openai_config(config)
     attach_saved_images(questions)
     for question in questions:
@@ -272,9 +322,137 @@ def solve_questions(questions: list[dict], config: dict | None = None, log=print
     solved: dict[int, str | list] = {}
     plain = [item for item in questions if not item.get("images")]
     pictured = [item for item in questions if item.get("images")]
-    _solve_batches(questions, plain, 10, api_key, base_url, model, solved, log, on_update)
-    _solve_batches(questions, pictured, 1, api_key, base_url, model, solved, log, on_update)
+    # 每批少一点，减少模型串题、漏题
+    _solve_batches(questions, plain, 5, api_key, base_url, model, solved, log, on_update, persist)
+    _solve_batches(questions, pictured, 1, api_key, base_url, model, solved, log, on_update, persist)
     return _answer_records(questions, solved)
+
+
+def answers_equal(kind: str, left, right, options: dict | None = None) -> bool:
+    if kind == "judge":
+        return desired_truth(str(left or ""), options) == desired_truth(str(right or ""), options)
+    if kind == "blank":
+        left_parts = left if isinstance(left, list) else [left]
+        right_parts = right if isinstance(right, list) else [right]
+        if len(left_parts) != len(right_parts):
+            return False
+        return all(
+            re.sub(r"\s+", "", str(a or "")) == re.sub(r"\s+", "", str(b or ""))
+            for a, b in zip(left_parts, right_parts)
+        )
+    if kind == "essay":
+        return re.sub(r"\s+", "", str(left or "")) == re.sub(r"\s+", "", str(right or ""))
+    return str(left or "").strip().upper() == str(right or "").strip().upper()
+
+
+def find_answer_diffs(original: list[dict], reviewed: list[dict]) -> list[dict]:
+    by_no = {item["no"]: item for item in reviewed}
+    diffs = []
+    for item in original:
+        other = by_no.get(item["no"])
+        if other is None:
+            continue
+        if answers_equal(item["type"], item.get("answer"), other.get("answer"), item.get("options") or {}):
+            continue
+        diffs.append(
+            {
+                "no": item["no"],
+                "type": item["type"],
+                "stem": item.get("stem") or "",
+                "options": item.get("options") or {},
+                "original": item.get("answer"),
+                "reviewed": other.get("answer"),
+            }
+        )
+    return diffs
+
+
+def review_answers(
+    questions: list[dict],
+    original: list[dict],
+    config: dict | None = None,
+    log=print,
+    on_progress=None,
+) -> tuple[list[dict], list[dict]]:
+    """用另一套接口独立作答，不改写 answers.json。返回验证结果和分歧题。"""
+    wanted = {item["no"] for item in original if item.get("answer") not in ("", None, [])}
+    selected = [item for item in questions if item["no"] in wanted]
+    if not selected:
+        raise SystemExit("当前没有可验证的答案")
+
+    def progress(records: list[dict]) -> None:
+        if on_progress:
+            on_progress(records)
+
+    reviewed = solve_questions(selected, config=config, log=log, on_update=progress, persist=False)
+    # 补上未验证题，便于整表对照
+    by_no = {item["no"]: item for item in reviewed}
+    merged = []
+    for item in original:
+        copy = dict(item)
+        if item["no"] in by_no:
+            copy["answer"] = by_no[item["no"]].get("answer")
+            copy["images"] = by_no[item["no"]].get("images") or item.get("images") or []
+        merged.append(copy)
+    return merged, find_answer_diffs(original, reviewed)
+
+
+def regenerate_one(
+    question: dict,
+    previous,
+    config: dict | None = None,
+    log=print,
+) -> str | list:
+    """针对单题重新作答。明确告诉模型旧答案是错的，必须换一个。"""
+    api_key, base_url, model = openai_config(config)
+    attach_saved_images([question])
+    entry = _payload_question(question)
+    entry["wrong_answer"] = previous
+    system = (
+        "你是课程测验阅卷助手。只根据题干、选项和附图独立作答。"
+        "用户已经确认 wrong_answer 是错误答案，禁止再返回相同答案。"
+        "必须给出另一个更合理的正确答案。"
+        "单选题的 value 只能是一个大写字母。"
+        "多选题的 value 是所有正确选项字母按字母序连写，例如 AD。"
+        "判断题的 value 只能是「对」或「错」。"
+        "填空题只有一个空时，value 是字符串；多个空时 value 必须是数组。"
+        "简答题的 value 是一段直接回答题干的文字，300字以内。"
+        "如果题目要求上传或绘制图片作为答案，value 填「需上传图片」。"
+        "只输出一个 JSON 对象，格式为 "
+        '{"answers":[{"no":1,"value":"B"}]}，不要输出其他文字。'
+    )
+    user_payload = {"questions": [entry], "instruction": "wrong_answer 已被确认错误，请给出不同答案"}
+    content: str | list[dict]
+    if question.get("images"):
+        content = [
+            {"type": "text", "text": json.dumps(user_payload, ensure_ascii=False)},
+            {"type": "text", "text": f"附图是第 {question['no']} 题"},
+            *[_image_part(path) for path in question["images"]],
+        ]
+    else:
+        content = json.dumps(user_payload, ensure_ascii=False)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": content},
+    ]
+    log(f"正在重新生成第 {question['no']} 题（排除旧答案 {previous}）")
+    last_error = None
+    for _ in range(3):
+        try:
+            result = chat_json(api_key, base_url, model, messages)
+            raw = next(item["value"] for item in result["answers"] if int(item["no"]) == question["no"])
+            answer = normalize_answer(question, raw)
+            if answers_equal(question["type"], answer, previous, question.get("options") or {}):
+                last_error = RuntimeError(f"模型仍返回旧答案 {answer!r}")
+                log(f"第 {question['no']} 题仍得到旧答案，重试")
+                time.sleep(0.6)
+                continue
+            return answer
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            log(f"第 {question['no']} 题重试: {exc}")
+            time.sleep(0.8)
+    raise SystemExit(f"第 {question['no']} 题重新生成失败: {last_error}")
 
 
 def _solve_batches(
@@ -287,9 +465,12 @@ def _solve_batches(
     solved: dict[int, str | list],
     log,
     on_update,
+    persist: bool = True,
 ) -> None:
     system = (
-        "你是课程测验阅卷助手。只根据题干、选项和附图作答。"
+        "你是课程测验阅卷助手。只根据题干、选项和附图独立作答。"
+        "如果题干或选项里出现「我的答案」或已填内容，一律忽略，不要照抄。"
+        "先判断题意和每个选项，再给出最终答案，不要猜测。"
         "单选题的 value 只能是一个大写字母。"
         "多选题的 value 是所有正确选项字母按字母序连写，例如 AD。"
         "判断题的 value 只能是「对」或「错」。选项顺序不固定，A 可能是对，也可能是错。"
@@ -334,8 +515,9 @@ def _solve_batches(
             else:
                 raise SystemExit(f"{label}作答失败: {last_error}")
         current = _answer_records(questions, solved)
-        RUNTIME.mkdir(exist_ok=True)
-        ANSWERS_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        if persist:
+            RUNTIME.mkdir(exist_ok=True)
+            ANSWERS_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
         if on_update:
             on_update(current)
 
@@ -611,92 +793,268 @@ def apply_answers(
         if group is None:
             raise SystemExit(f"页面上没有第 {number} 题")
         scroll_into_view(group)
+        time.sleep(0.08)
+        expected = record["answer"]
         if record["type"] in {"blank", "essay"}:
             status = fill_blank(
                 group,
-                record["answer"],
+                expected,
                 window,
                 multiline=record["type"] == "essay",
             )
         else:
-            status = choose_option(group, record["type"], record["answer"], record.get("options") or {})
-        line = {"no": number, "answer": record["answer"], "status": status}
-        log(f"第 {number} 题 -> {record['answer']} ({status})")
+            status = choose_option(group, record["type"], expected, record.get("options") or {})
+            # 再读一次页面，防止 UIA 报成功但页面仍是旧选项
+            if status.startswith("partial") or status.startswith("miss"):
+                time.sleep(0.12)
+                status = choose_option(group, record["type"], expected, record.get("options") or {})
+        line = {"no": number, "answer": expected, "status": status}
+        if status.startswith("partial") or status.startswith("miss") or status in {"missing", "no-controls", "写入未生效"}:
+            log(f"第 {number} 题写入异常 -> 期望 {expected} ({status})")
+        else:
+            log(f"第 {number} 题 -> {expected} ({status})")
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(line, ensure_ascii=False) + "\n")
-        time.sleep(0.05)
+        time.sleep(0.08)
 
 
 def control_is_checked(control) -> bool:
+    """综合判断是否已选中。
+
+    打回重做页常见：Legacy 默认动作全部仍是「选定」，不能据此判未选；
+    此时改看 SelectionItem.IsSelected。若 Legacy 明确是「取消选定」则可信。
+    """
     import uiautomation as auto
 
     legacy = control.GetPattern(auto.PatternId.LegacyIAccessiblePattern)
     action = legacy.DefaultAction if legacy else ""
     if "取消" in action:
         return True
-    if "选定" in action:
+    try:
+        if bool(control.GetSelectionItemPattern().IsSelected):
+            return True
+    except Exception:
+        pass
+    try:
+        if control.GetTogglePattern().ToggleState == auto.ToggleState.On:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def filled_answer_from_group(group) -> str:
+    """读取题目下方「我的答案 / 您的答案」。比控件勾选状态更贴近页面显示。"""
+    names: list[str] = []
+
+    def walk(control, depth: int) -> None:
+        if depth > 7:
+            return
+        name = (control.Name or "").strip()
+        if name:
+            names.append(name)
+        for child in control.GetChildren():
+            walk(child, depth + 1)
+
+    walk(group, 0)
+    blob = " ".join(names)
+    matched = re.search(r"(?:我的答案|您的答案)\s*[:：]?\s*([A-H]+|对|错)", blob)
+    if not matched:
+        return ""
+    return matched.group(1).replace(" ", "").upper()
+
+
+def option_body(name: str) -> str:
+    """从控件名里取出选项正文。页面常把「选择」粘在末尾，且打回后字母会乱序。"""
+    text = (name or "").strip()
+    text = re.sub(r"^[A-H]\s*", "", text)
+    text = re.sub(r"(取消选定|选定|选择)$", "", text)
+    return _compact_text(text)
+
+
+def _texts_match(left: str, right: str) -> bool:
+    a = _compact_text(left)
+    b = _compact_text(right)
+    if not a or not b:
         return False
-    return control.GetTogglePattern().ToggleState == auto.ToggleState.On
+    if a == b:
+        return True
+    # 只允许较长包含，避免「左」之类短串误命中
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    return len(shorter) >= 8 and shorter in longer
+
+
+def _control_for_text(controls, wanted_text: str):
+    wanted = _compact_text(wanted_text)
+    if not wanted:
+        return None
+    scored = []
+    for control in controls:
+        body = option_body(control.Name)
+        if not body:
+            continue
+        if body == wanted:
+            return control
+        if _texts_match(body, wanted):
+            scored.append((min(len(body), len(wanted)), control))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def _resolve_choice_targets(controls, kind: str, answer: str, options: dict | None) -> list:
+    """按选项文字定位控件。打回重做后 A/B/C 字母会换位，不能只认字母。"""
+    options = options or {}
+    if kind == "judge":
+        truth = desired_truth(answer, options)
+        if truth:
+            matched = [control for control in controls if option_truth(control.Name) == truth]
+            if matched:
+                return matched
+        letter = answer[:1].upper() if answer else ""
+        if letter in options:
+            target = _control_for_text(controls, options[letter])
+            if target is not None:
+                return [target]
+        return [control for control in controls if option_letter(control.Name) == letter]
+    letters = list(answer) if kind == "multi" else [answer]
+    targets = []
+    for letter in letters:
+        text = options.get(letter) or ""
+        target = _control_for_text(controls, text) if text else None
+        if target is None:
+            target = next((control for control in controls if option_letter(control.Name) == letter), None)
+        if target is not None and target not in targets:
+            targets.append(target)
+    return targets
+
+
+def _selected_controls(controls) -> list:
+    return [control for control in controls if control_is_checked(control)]
+
+
+def _selected_letters(controls) -> list[str]:
+    return [letter for control in _selected_controls(controls) if (letter := option_letter(control.Name))]
+
+
+def _selected_truths(controls) -> list[str]:
+    return [truth for control in _selected_controls(controls) if (truth := option_truth(control.Name))]
+
+
+def _activate_choice(control) -> None:
+    """打回重做页优先鼠标点击，再退回默认动作。"""
+    import uiautomation as auto
+
+    scroll_into_view(control)
+    time.sleep(0.06)
+    rect = control.BoundingRectangle
+    if not rect.isempty():
+        # 点偏左的圆点，避免点到整行文字区失效
+        x = rect.left + min(28, max(rect.width() // 10, 12))
+        y = rect.ycenter()
+        auto.Click(x, y, waitTime=0.14)
+        time.sleep(0.08)
+        if control_is_checked(control):
+            return
+    legacy = control.GetPattern(auto.PatternId.LegacyIAccessiblePattern)
+    if legacy is not None:
+        action = legacy.DefaultAction or ""
+        if "取消" not in action:
+            legacy.DoDefaultAction(waitTime=0.14)
+            time.sleep(0.08)
+            if control_is_checked(control):
+                return
+    try:
+        pattern = control.GetSelectionItemPattern()
+        if pattern is not None:
+            pattern.Select(waitTime=0.1)
+    except Exception:
+        pass
+
+
+def _single_choice_ok(group, target, wanted_text: str) -> tuple[bool, str]:
+    """确认单选是否落到目标正文。优先「我的答案」，再看勾选控件。"""
+    controls = choice_controls(group)
+    page_letter = filled_answer_from_group(group)
+    target_letter = option_letter(target.Name) or ""
+    if page_letter:
+        if target_letter and page_letter == target_letter:
+            return True, page_letter
+        # 页面字母对上某控件后，再核对正文
+        matched = next((control for control in controls if option_letter(control.Name) == page_letter), None)
+        if matched is not None and wanted_text and _texts_match(option_body(matched.Name), wanted_text):
+            return True, page_letter
+    selected = _selected_controls(controls)
+    if len(selected) == 1:
+        pick = selected[0]
+        pick_letter = option_letter(pick.Name) or "?"
+        if pick is target or (wanted_text and _texts_match(option_body(pick.Name), wanted_text)):
+            return True, pick_letter
+    return False, page_letter or "".join(_selected_letters(controls))
 
 
 def choose_option(group, kind: str, answer: str, options: dict | None = None) -> str:
-    import uiautomation as auto
-
+    options = options or {}
     controls = choice_controls(group)
     if not controls:
         return "no-controls"
+    targets = _resolve_choice_targets(controls, kind, answer, options)
+    if not targets:
+        return "missing"
     if kind == "judge":
         truth = desired_truth(answer, options)
-        target = next((control for control in controls if option_truth(control.Name) == truth), None) if truth else None
-        if target is None:
-            target = next((control for control in controls if option_letter(control.Name) == answer), None)
-        if target is None:
-            return "missing"
-        pattern = target.GetSelectionItemPattern()
-        if not pattern.IsSelected:
-            pattern.Select(waitTime=0.05)
-        return "selected"
-    wanted = set(answer)
+        target = targets[0]
+        for _ in range(4):
+            if truth and _selected_truths(choice_controls(group)) == [truth]:
+                return "selected"
+            filled = filled_answer_from_group(group)
+            if truth and filled in {truth, "对" if truth == "对" else "错"}:
+                return "selected"
+            if control_is_checked(target) and len(_selected_controls(choice_controls(group))) == 1:
+                return "selected"
+            _activate_choice(target)
+            time.sleep(0.18)
+        actual = "".join(_selected_truths(choice_controls(group)) or _selected_letters(choice_controls(group)))
+        return "selected" if (truth and actual == truth) else f"partial-{actual or filled_answer_from_group(group) or '?'}"
     if kind == "multi":
+        wanted_ids = {id(control) for control in targets}
         missed = []
         for control in controls:
-            letter = option_letter(control.Name)
-            should = letter in wanted
+            should = id(control) in wanted_ids
             if control_is_checked(control) == should:
                 continue
-            legacy = control.GetPattern(auto.PatternId.LegacyIAccessiblePattern)
-            if legacy is None or not legacy.DoDefaultAction(waitTime=0.15):
-                missed.append(letter)
-                continue
-            time.sleep(0.12)
+            _activate_choice(control)
+            time.sleep(0.14)
             if control_is_checked(control) != should:
-                missed.append(letter)
+                missed.append(option_letter(control.Name) or "?")
         return "checked" if not missed else "miss-" + "".join(missed)
-    target = next((control for control in controls if option_letter(control.Name) == answer), None)
-    if target is None:
-        return "missing"
-    pattern = target.GetSelectionItemPattern()
-    if not pattern.IsSelected:
-        pattern.Select(waitTime=0.05)
-    picked = [
-        option_letter(control.Name)
-        for control in controls
-        if control.GetSelectionItemPattern().IsSelected
-    ]
-    if picked == [answer]:
-        return "selected"
-    return "partial-" + "".join(picked)
+    target = targets[0]
+    wanted_text = options.get(answer) or option_body(target.Name)
+    for _ in range(4):
+        ok, page_letter = _single_choice_ok(group, target, wanted_text)
+        if ok:
+            return "selected" if page_letter == answer else f"selected@{page_letter or '?'}"
+        _activate_choice(target)
+        time.sleep(0.2)
+    ok, page_letter = _single_choice_ok(group, target, wanted_text)
+    if ok:
+        return "selected" if page_letter == answer else f"selected@{page_letter or '?'}"
+    return "partial-" + (page_letter or "?")
 
 
 def _compact_text(text: str) -> str:
-    return re.sub(r"\s+", "", text or "")
+    # 去掉空白和编辑器常见的零宽字符，避免「左」误判成已写入「左外」
+    cleaned = re.sub(r"[\u200b\u200c\u200d\ufeff\u2060]", "", text or "")
+    return re.sub(r"\s+", "", cleaned)
 
 
 def _answer_landed(actual: str | None, expected: str) -> bool:
+    """必须整段一致。不能用包含判断，否则「左」会把残留的「左外」当成成功。"""
     wanted = _compact_text(expected)
     if actual is None or not wanted:
         return False
-    return wanted in _compact_text(actual)
+    return _compact_text(actual) == wanted
 
 
 def _editor_text(editor) -> str | None:
@@ -842,14 +1200,18 @@ def _ensure_editor_focus(editor, window) -> str | None:
 
 
 def paste_into_editor(editor, answer: str, window, multiline: bool = False) -> str:
-    """先粘贴。页面禁止粘贴或粘贴没有写入时，改为逐字输入。"""
+    """先清空再粘贴。页面禁止粘贴或内容对不上时，改为逐字输入。"""
     import uiautomation as auto
 
     error = _focus_editor(editor, window)
     if error:
         return error
+    # 必须先清空旧内容，否则短答案会叠在「左外」这类旧词上
+    _clear_editor()
+    error = _ensure_editor_focus(editor, window)
+    if error:
+        return error
     auto.SetClipboardText(answer)
-    auto.SendKeys("{Ctrl}a", waitTime=0.05, charMode=False)
     auto.SendKeys("{Ctrl}v", waitTime=0.16, charMode=False)
     _dismiss_paste_block()
     error = _ensure_editor_focus(editor, window)
@@ -861,7 +1223,10 @@ def paste_into_editor(editor, answer: str, window, multiline: bool = False) -> s
     for attempt, interval in enumerate((0.01, 0.02)):
         _type_answer(answer, multiline, interval)
         current = _current_editor_text(editor, window)
-        if _answer_landed(current, answer) or current is None:
+        if _answer_landed(current, answer):
+            return "逐字写入"
+        # 读不到内容时不贸然当成成功，再试一次更稳
+        if current is None and attempt == 1:
             return "逐字写入"
         if attempt == 0:
             _clear_editor()
@@ -928,28 +1293,43 @@ def verify_answers(
         if group is None:
             mismatches.append({"no": record["no"], "expected": record["answer"], "actual": "页面上没有这题"})
             continue
-        picked = []
-        truths = []
-        for control in choice_controls(group):
-            letter = option_letter(control.Name)
-            if control.ControlTypeName == "CheckBoxControl":
-                on = control_is_checked(control)
-            else:
-                on = control.GetSelectionItemPattern().IsSelected
-            if on:
-                picked.append(letter)
-                truth = option_truth(control.Name)
-                if truth:
-                    truths.append(truth)
+        options = record.get("options") or {}
+        expected = record["answer"]
+        filled = filled_answer_from_group(group)
+        selected = _selected_controls(choice_controls(group))
         if record["type"] == "judge":
-            expected_truth = desired_truth(record["answer"], record.get("options") or {})
-            actual = truths[0] if len(truths) == 1 else "".join(picked)
-            expected = expected_truth or record["answer"]
+            expected_truth = desired_truth(expected, options)
+            truths = [truth for control in selected if (truth := option_truth(control.Name))]
+            picked_letters = [letter for control in selected if (letter := option_letter(control.Name))]
+            actual = truths[0] if len(truths) == 1 else (filled or "".join(picked_letters))
+            wanted = expected_truth or expected
+            if actual != wanted:
+                mismatches.append({"no": record["no"], "expected": wanted, "actual": actual or "?"})
+            continue
+        if record["type"] == "multi":
+            picked_letters = [letter for control in selected if (letter := option_letter(control.Name))]
+            actual = "".join(sorted(picked_letters or list(filled)))
+            wanted = "".join(sorted(expected))
+            if actual != wanted:
+                mismatches.append({"no": record["no"], "expected": wanted, "actual": actual or "?"})
+            continue
+        # 单选：按选项正文核对，兼容打回重做后字母换位
+        wanted_text = options.get(expected) or ""
+        ok = False
+        picked_letters = [letter for control in selected if (letter := option_letter(control.Name))]
+        actual = filled or "".join(picked_letters)
+        if wanted_text and selected:
+            ok = any(_texts_match(option_body(control.Name), wanted_text) for control in selected)
+        elif wanted_text and filled:
+            matched = next(
+                (control for control in choice_controls(group) if option_letter(control.Name) == filled),
+                None,
+            )
+            ok = matched is not None and _texts_match(option_body(matched.Name), wanted_text)
         else:
-            actual = "".join(sorted(picked))
-            expected = "".join(sorted(record["answer"]))
-        if actual != expected:
-            mismatches.append({"no": record["no"], "expected": expected, "actual": actual})
+            ok = actual == expected
+        if not ok:
+            mismatches.append({"no": record["no"], "expected": expected, "actual": actual or "?"})
     return mismatches
 
 

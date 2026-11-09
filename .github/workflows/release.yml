@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要发布的版本号（如 v0.2.0）；留空则仅构建不发版"
-        required: false
-        default: ""
+        description: "版本标签（如 v1.0.0）。手动运行且填写后，会基于当前提交发版"
+        required: true
+        default: "v1.0.0"
 
 permissions:
   contents: write
@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,34 +38,98 @@ jobs:
         id: meta
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
             TAG="${{ github.ref_name }}"
-          elif [[ -n "${{ inputs.tag }}" ]]; then
-            TAG="${{ inputs.tag }}"
           else
-            TAG=""
+            TAG="${{ inputs.tag }}"
           fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+            echo "Invalid tag: $TAG (expected like v1.0.0)"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          ASSET="作业答题-超星智慧树-${VERSION}.exe"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "asset=作业答题-超星智慧树.exe" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${TAG} -> ${ASSET}"
 
       - name: Build exe
         run: uv run pyinstaller --noconfirm auto_answer.spec
 
-      - name: Upload artifact
+      - name: Stage release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          src="dist/作业答题-超星智慧树.exe"
+          dst="release/${{ steps.meta.outputs.asset }}"
+          test -f "$src"
+          cp "$src" "$dst"
+          ls -lh "$dst"
+
+      - name: Extract changelog for this version
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          text = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          # Match ## [1.0.0] - date ... until next ## [
+          pattern = rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)"
+          match = re.search(pattern, text, flags=re.M | re.S)
+          lines = [
+              f"## {tag}",
+              "",
+              f"下载下方附件 **作业答题-超星智慧树-{version}.exe**（Windows，免安装）。",
+              "",
+              "配置与答案会写在 exe 同级的 `runtime/` 目录；不会自动点击提交。",
+              "",
+          ]
+          if match:
+              body = match.group(1).strip()
+              lines.extend(["### 更新说明", "", body, ""])
+          else:
+              lines.extend(
+                  [
+                      "> 未在 `CHANGELOG.md` 找到该版本章节，已附自动生成的提交说明。",
+                      "",
+                  ]
+              )
+          Path("release_notes.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+          print(Path("release_notes.md").read_text(encoding="utf-8"))
+          PY
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 作业答题-超星智慧树
-          path: dist/作业答题-超星智慧树.exe
+          name: ${{ steps.meta.outputs.asset }}
+          path: release/${{ steps.meta.outputs.asset }}
           if-no-files-found: error
 
-      - name: Create GitHub Release
-        if: steps.meta.outputs.tag != ''
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.tag }}
-          generate_release_notes: true
-          files: dist/作业答题-超星智慧树.exe
+          body_path: release_notes.md
+          files: release/${{ steps.meta.outputs.asset }}
           fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          target_commitish: ${{ github.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

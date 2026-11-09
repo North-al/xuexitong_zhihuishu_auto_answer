@@ -106,14 +106,23 @@ uv run pyinstaller --noconfirm auto_answer.spec
 
 ### GitHub Releases（自动）
 
-推送版本标签后，Actions 会在 Windows 上打包并把 exe 挂到 Release：
+1. 在 [`CHANGELOG.md`](CHANGELOG.md) 写好该版本更新说明（`## [X.Y.Z] - 日期`）。
+2. 推送标签：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git add CHANGELOG.md
+git commit -m "Release v1.0.0"
+git tag v1.0.0
+git push origin main --tags
 ```
 
-也可在仓库 **Actions → Release → Run workflow** 手动触发（可填 `v0.2.0`）。
+Actions 会：
+
+- 在 Windows 上打包 `作业答题-超星智慧树.exe`
+- 上传为带版本号的附件：`作业答题-超星智慧树-1.0.0.exe`
+- 用 `CHANGELOG.md` 对应章节生成 Release 正文（并附自动提交摘要）
+
+也可在 **Actions → Release → Run workflow** 手动填写 `v1.0.0` 触发。
 
 ## 目录结构
 
@@ -127,11 +136,12 @@ auto_answer/          # 主代码
 assets/               # 图标
 docs/                 # 实现说明（控件识别与点击流程）
 runtime/              # 本地配置与答案（gitignore，仅保留示例）
+CHANGELOG.md          # 版本更新日志（发版必改）
 run_gui.py            # 打包入口
 auto_answer.spec      # PyInstaller 配置
 ```
 
-更细的控件识别说明见 [docs/作业作答流程.md](docs/作业作答流程.md)。
+更细的控件识别说明见 [docs/作业作答流程.md](docs/作业作答流程.md)。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 安全与隐私
 

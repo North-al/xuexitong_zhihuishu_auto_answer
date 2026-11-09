@@ -1,6 +1,6 @@
 [project]
 name = "auto-answer"
-version = "0.2.0"
+version = "1.0.0"
 description = "本地辅助超星学习通 / 智慧树作业测验作答（只选答案，不提交）"
 readme = "README.md"
 license = { text = "MIT" }

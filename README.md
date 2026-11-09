@@ -95,12 +95,25 @@ uv run python -m auto_answer gui
 
 ## 打包成 exe
 
+本地：
+
 ```bash
 uv sync --group dev
 uv run pyinstaller --noconfirm auto_answer.spec
 ```
 
 产物：`dist/作业答题-超星智慧树.exe`（无控制台窗口）。配置与答案仍落在 exe 同级的 `runtime/`。
+
+### GitHub Releases（自动）
+
+推送版本标签后，Actions 会在 Windows 上打包并把 exe 挂到 Release：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+也可在仓库 **Actions → Release → Run workflow** 手动触发（可填 `v0.2.0`）。
 
 ## 目录结构
 

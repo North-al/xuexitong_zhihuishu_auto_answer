@@ -19,7 +19,10 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/North-al/xuexitong_zhihuishu_auto_answer"
 Documentation = "docs/作业作答流程.md"
+Repository = "https://github.com/North-al/xuexitong_zhihuishu_auto_answer"
+Releases = "https://github.com/North-al/xuexitong_zhihuishu_auto_answer/releases"
 
 [project.scripts]
 auto-answer = "auto_answer.__main__:main"

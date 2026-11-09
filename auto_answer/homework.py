@@ -1394,7 +1394,9 @@ def add_openai_args(parser: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="作业读题、生成答案并在浏览器中选择，不提交")
+    parser = argparse.ArgumentParser(
+        description="作业答题（超星 / 智慧树）：读题、生成答案并在浏览器中选择，不提交"
+    )
     parser.add_argument("--page", type=Path, default=PAGE_TEXT)
     sub = parser.add_subparsers(dest="command", required=True)
     parse_cmd = sub.add_parser("parse")

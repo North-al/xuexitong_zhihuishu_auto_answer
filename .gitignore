@@ -1,8 +1,67 @@
-runtime/
-build/
-dist/
-_page_text.txt
-_preview_q1.png
-.venv/
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- Virtual environments ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Secrets & local config ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# API keys / answers / screenshots live under runtime/
+runtime/*
+!runtime/.gitkeep
+!runtime/openai.example.json
+
+# Copied page text & debug captures at repo root
+_page_text.txt
+_zhihuishu_page_text.txt
+_preview*.png
+_*.png
+!assets/**
+
+# --- Packaging ---
+*.spec.bak
+*.manifest
+*.exe
+# keep the PyInstaller spec tracked
+!auto_answer.spec
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Logs & temp ---
+*.log
+*.tmp
+*.temp
+.cache/

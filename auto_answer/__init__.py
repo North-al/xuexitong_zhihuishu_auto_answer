@@ -1,1 +1,1 @@
-"""Homework answer helper. Selects answers in the browser and never submits."""
+"""作业答题助手：支持超星学习通与智慧树测验。只在浏览器里选答案，从不提交。"""

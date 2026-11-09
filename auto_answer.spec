@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='超星作业答题',
+    name='作业答题-超星智慧树',
     icon='assets/icon.ico',
     debug=False,
     bootloader_ignore_signals=False,

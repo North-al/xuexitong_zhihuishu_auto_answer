@@ -1,13 +1,37 @@
 [project]
 name = "auto-answer"
-version = "0.1.0"
+version = "0.2.0"
+description = "本地辅助超星学习通 / 智慧树作业测验作答（只选答案，不提交）"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.14"
+keywords = ["chaoxing", "zhihuishu", "homework", "uiautomation"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Education",
+]
 dependencies = [
     "pillow>=13.0.0",
     "uiautomation>=2.0.29",
 ]
 
+[project.urls]
+Documentation = "docs/作业作答流程.md"
+
+[project.scripts]
+auto-answer = "auto_answer.__main__:main"
+
 [dependency-groups]
 dev = [
     "pyinstaller>=6.22.3",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["auto_answer"]

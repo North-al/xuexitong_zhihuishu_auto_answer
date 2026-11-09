@@ -1,4 +1,4 @@
-"""超星作业答题的桌面操作窗口。"""
+"""超星学习通与智慧树作业测验的桌面操作窗口。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,13 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from auto_answer.browser import copy_page_text, describe_inspection, inspect_homework_window, list_homework_windows
+from auto_answer.browser import (
+    copy_page_text,
+    describe_inspection,
+    detect_platform,
+    inspect_homework_window,
+    list_homework_windows,
+)
 from auto_answer.config import PROVIDER_NAMES, PROVIDERS, icon_file, load_store, save_store
 from auto_answer.homework import (
     ANSWERS_PATH,
@@ -24,6 +30,7 @@ from auto_answer.homework import (
     solve_questions,
     verify_answers,
 )
+from auto_answer import zhihuishu
 
 TYPE_LABEL = {"single": "单选", "multi": "多选", "judge": "判断", "blank": "填空", "essay": "简答"}
 
@@ -45,20 +52,27 @@ OK_BG = "#ECFDF5"
 OK_FG = "#047857"
 LOG_BG = "#0F172A"
 LOG_FG = "#E2E8F0"
+APP_NAME = "作业答题 · 超星 / 智慧树"
+APP_TAGLINE = "学习通作业 + 智慧树测验"
+
 NAV_ITEMS = (
-    ("work", "作业作答"),
+    ("work", "作答"),
     ("settings", "AI 设置"),
     ("help", "使用说明"),
 )
 
-HELP_TEXT = """超星作业答题 · 使用说明
+HELP_TEXT = """作业答题 · 超星 / 智慧树 · 使用说明
 
-本程序只在本地辅助作答，不会点击「提交 / 交卷 / 暂时保存」。
+本程序只在本地辅助作答，不会点击「提交 / 交卷 / 暂时保存 / 提交作业 / 暂存作业」。
+
+支持平台：
+· 超星学习通「作业作答」（可一页多题）
+· 智慧树「作业考试 / 单元测试」（一题一页；选项常随机排序，按选项正文匹配写入）
 
 
 一、开始前请准备好
 
-1. 用 Chrome 或 Edge 打开超星的「作业作答」页面，并保持这个标签页在前台。
+1. 用 Chrome 或 Edge 打开超星「作业作答」或智慧树「作业考试」页，并保持该标签在前台。
 2. 打开本程序，点左侧「AI 设置」。
 3. 在「答题服务」里填写：接口地址、模型名、API Key，然后点「保存配置」。
    · 模型名由你自己填，不限于官方名字（例如 deepseek-flash、gpt-4o-mini、自建名均可）。
@@ -70,10 +84,10 @@ HELP_TEXT = """超星作业答题 · 使用说明
 
 二、日常怎么用（按这个顺序）
 
-1. 刷新窗口 → 在下拉里选中刚才的作业浏览器窗口。
-   可点「检测窗口」，确认作业名称和 workId 是否正确。
+1. 刷新窗口 → 在下拉里选中对应作答窗口（会标注「超星」或「智慧树」）。
+   可点「检测窗口」，确认作业名称和题量。
 2. 更新题目
-   从当前页面读取题目到左侧列表。这一步不会改答案，也不会提交。
+   从当前页面读取题目到左侧列表。智慧树会自动逐题翻页收集，不会提交。
 3. 生成答案
    用「答题服务」逐题作答，答案会出现在列表的「答案」列。
 4. （可选）AI验证
@@ -81,7 +95,7 @@ HELP_TEXT = """超星作业答题 · 使用说明
 5. （可选）单题重做
    在列表里选中某题，点「重新生成本题」，或直接双击该行。
 6. 写入页面
-   把列表里的答案写回浏览器选项 / 填空框。写完后请你自己在网页上检查。
+   把列表里的答案写回浏览器。超星直接勾选；智慧树按选项正文点选，并会点「下一题 / 保存」；都不会点提交。
 7. （可选）核对
    检查选择题是否与列表一致。填空、简答目前还不能自动核对。
 
@@ -99,8 +113,8 @@ HELP_TEXT = """超星作业答题 · 使用说明
 四、支持哪些题型
 
 · 单选题、多选题、判断题
-· 填空题（包括一题多空）
-· 简答题
+· 填空题（包括一题多空）——超星可写入；智慧树暂不支持填空/简答写入
+· 简答题——同上
 · 带图片的题目：更新题目时会截图；生成答案时发给支持看图的模型
 
 暂不支持：编程题、需要上传图片作答的题。
@@ -110,10 +124,10 @@ HELP_TEXT = """超星作业答题 · 使用说明
 
 · 请用项目虚拟环境，或打包好的 exe 运行。系统自带的 Python 可能缺识别库。
 · 写过答案后再点「更新题目」也没关系：页面上的「我的答案」会被自动去掉，不会带给模型。
-· 打回重做的作业，选项字母可能被打乱。程序会按选项文字匹配，不以页面上的 A/B/C 为准。
+· 打回重做或智慧树测验，选项字母可能被打乱。程序会按选项文字匹配，不以页面上的 A/B/C 为准。
 · 填空若禁止粘贴，会改成逐字输入；写入前会先清掉旧内容。
-· 日志若出现 miss / 写入未生效，说明这一题页面结果与期望不一致，可选中后单独再写一次。
-· 最终是否交卷，由你在超星页面上决定。
+· 日志若出现 miss / 写入未生效 / skip-unknown-state，说明这一题页面结果与期望不一致，可选中后单独再写一次。
+· 最终是否交卷，由你在浏览器页面上自行决定。
 """
 
 
@@ -127,7 +141,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         _enable_dpi()
         super().__init__()
-        self.title("超星作业答题")
+        self.title(APP_NAME)
         icon = icon_file()
         if icon.exists():
             self.iconbitmap(str(icon))
@@ -139,9 +153,12 @@ class App(tk.Tk):
         self.windows: list[dict] = []
         self.records: list[dict] = []
         self._inspect_token = 0
+        self._refresh_token = 0
+        self._refreshing = False
         self.questions_current = False
         self.question_work_id = ""
         self.question_name = ""
+        self.question_platform = "chaoxing"
         self.detected_work_id = ""
         self.detected_name = ""
         self._profiles: dict = {}
@@ -155,8 +172,9 @@ class App(tk.Tk):
         self._load_config()
         self._load_saved_answers()
         self._refresh_question_banner()
-        self.refresh_windows()
         self.after(120, self._poll)
+        # 启动后再后台刷新，避免构造界面时卡死
+        self.after(200, self.refresh_windows)
 
     def _build_style(self) -> None:
         style = ttk.Style(self)
@@ -260,7 +278,9 @@ class App(tk.Tk):
         side.pack_propagate(False)
         brand = tk.Frame(side, bg=SIDEBAR)
         brand.pack(fill="x", padx=18, pady=22)
-        tk.Label(brand, text="超星作业答题", bg=SIDEBAR, fg=INK, font=("Microsoft YaHei UI", 14, "bold"), anchor="w").pack(fill="x")
+        tk.Label(brand, text="作业答题", bg=SIDEBAR, fg=INK, font=("Microsoft YaHei UI", 14, "bold"), anchor="w").pack(fill="x")
+        tk.Label(brand, text="超星 · 智慧树", bg=SIDEBAR, fg=ACCENT_DEEP, font=("Microsoft YaHei UI", 10, "bold"), anchor="w").pack(fill="x", pady=(2, 0))
+        tk.Label(brand, text=APP_TAGLINE, bg=SIDEBAR, fg=MUTED, font=("Microsoft YaHei UI", 8), anchor="w").pack(fill="x", pady=(4, 0))
         tk.Label(side, text="工作区", bg=SIDEBAR, fg=MUTED, font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", padx=18, pady=(8, 6))
         for key, title in NAV_ITEMS:
             item = tk.Label(
@@ -285,17 +305,24 @@ class App(tk.Tk):
         inner.pack(fill="x", padx=18, pady=14)
         left = tk.Frame(inner, bg=SIDEBAR)
         left.pack(side="left", fill="x", expand=True)
-        self.page_title = tk.Label(left, text="作业作答", bg=SIDEBAR, fg=TEXT, font=("Microsoft YaHei UI", 16, "bold"), anchor="w")
+        self.page_title = tk.Label(left, text="作答", bg=SIDEBAR, fg=TEXT, font=("Microsoft YaHei UI", 16, "bold"), anchor="w")
         self.page_title.pack(anchor="w")
-        self.page_subtitle = tk.Label(left, text="选窗口 → 更新题目 → 生成答案 → 写入页面", bg=SIDEBAR, fg=MUTED, font=("Microsoft YaHei UI", 9), anchor="w")
+        self.page_subtitle = tk.Label(
+            left,
+            text="超星作业 / 智慧树测验 · 选窗口 → 更新题目 → 生成答案 → 写入页面",
+            bg=SIDEBAR,
+            fg=MUTED,
+            font=("Microsoft YaHei UI", 9),
+            anchor="w",
+        )
         self.page_subtitle.pack(anchor="w", pady=2)
 
     def _show_page(self, page: str) -> None:
         self._page = page
         titles = {
-            "work": ("作业作答", "选窗口 → 更新题目 → 生成答案 → 写入页面"),
+            "work": ("作答", "超星作业 / 智慧树测验 · 选窗口 → 更新题目 → 生成答案 → 写入页面"),
             "settings": ("AI 设置", "答题 / 验证分开保存；模型名自定义，兼容 OpenAI 返回格式即可"),
-            "help": ("使用说明", "按顺序操作即可，程序不会点击提交"),
+            "help": ("使用说明", "超星与智慧树通用流程；程序不会点击提交"),
         }
         self.page_title.configure(text=titles[page][0])
         self.page_subtitle.configure(text=titles[page][1])
@@ -322,7 +349,7 @@ class App(tk.Tk):
 
     def _build_work_page(self, parent: tk.Misc) -> tk.Frame:
         page = tk.Frame(parent, bg=BG)
-        browser_shell, browser = self._card(page, "作业窗口")
+        browser_shell, browser = self._card(page, "作答窗口")
         browser_shell.pack(fill="x")
         browser_row = tk.Frame(browser, bg=CARD)
         browser_row.pack(fill="x", pady=(8, 0))
@@ -338,7 +365,7 @@ class App(tk.Tk):
         self.window_box.bind("<<ComboboxSelected>>", lambda _event: self.inspect_selected())
         self.window_info = tk.Label(
             browser,
-            text="选中窗口后会显示作业名称、题量和地址，并闪烁对应窗口。",
+            text="同时支持超星「作业作答」与智慧树「作业考试 / 单元测试」。选中后会显示平台、名称、题量和地址。",
             bg=CARD,
             fg=MUTED,
             justify="left",
@@ -498,7 +525,7 @@ class App(tk.Tk):
         actions.pack(fill="x", pady=16)
         self.save_button = ttk.Button(actions, text="保存配置", style="Primary.TButton", command=self.save_settings)
         self.save_button.pack(side="left")
-        ttk.Button(actions, text="返回作业作答", style="Plain.TButton", command=lambda: self._show_page("work")).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="返回作答", style="Plain.TButton", command=lambda: self._show_page("work")).pack(side="left", padx=(8, 0))
         return page
 
     def _build_help_page(self, parent: tk.Misc) -> tk.Frame:
@@ -665,12 +692,47 @@ class App(tk.Tk):
         self._show_page("help")
 
     def refresh_windows(self) -> None:
-        try:
-            self.windows = list_homework_windows()
-        except Exception as exc:  # noqa: BLE001 - show discovery errors in the log
+        if self._refreshing:
+            self.write_log("正在刷新窗口，请稍候")
+            return
+        self._refreshing = True
+        self._refresh_token += 1
+        token = self._refresh_token
+        self.refresh_button.configure(state="disabled")
+        self.detect_button.configure(state="disabled")
+        self._set_window_detail("正在刷新窗口列表…")
+        self.write_log("开始刷新窗口")
+
+        def work() -> None:
+            try:
+                windows = list_homework_windows()
+                error = ""
+            except Exception as exc:  # noqa: BLE001
+                windows = []
+                error = str(exc)
+            self.events.put(("refresh", (token, windows, error)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_refresh(self, token: int, windows: list[dict], error: str) -> None:
+        if token != self._refresh_token:
+            return
+        self._refreshing = False
+        if not (self.worker and self.worker.is_alive()):
+            self.refresh_button.configure(state="normal")
+            self.detect_button.configure(state="normal")
+        if error:
             self.windows = []
-            self.write_log(f"刷新窗口失败：{exc}")
-        labels = [f"{item['browser']}    {item['title']}" for item in self.windows]
+            self.window_box["values"] = []
+            self.window_var.set("")
+            self._set_window_detail("刷新窗口失败")
+            self.write_log(f"刷新窗口失败：{error}")
+            return
+        self.windows = windows
+        labels = []
+        for item in self.windows:
+            plat = "智慧树" if item.get("platform") == "zhihuishu" else "超星"
+            labels.append(f"{item['browser']} · {plat} · {item['title']}")
         self.window_box["values"] = labels
         if labels:
             self.window_box.current(0)
@@ -678,8 +740,8 @@ class App(tk.Tk):
             self.inspect_selected()
         else:
             self.window_var.set("")
-            self._set_window_detail("没有找到 Chrome 或 Edge 中的「作业作答」窗口")
-            self.write_log("没有找到 Chrome 或 Edge 中的「作业作答」窗口")
+            self._set_window_detail("没有找到超星「作业作答」或智慧树「作业考试」窗口")
+            self.write_log("没有找到超星「作业作答」或智慧树「作业考试」窗口")
 
     def selected_window(self) -> dict | None:
         index = self.window_box.current()
@@ -698,11 +760,20 @@ class App(tk.Tk):
             return
         self._inspect_token += 1
         token = self._inspect_token
+        handle = item["handle"]
+        self.detect_button.configure(state="disabled")
         self._set_window_detail("正在检测选中窗口…")
 
         def work() -> None:
             try:
-                info = inspect_homework_window(item["handle"])
+                # 后台线程里初始化 COM，避免 UIA 偶发卡死
+                try:
+                    import comtypes
+
+                    comtypes.CoInitialize()
+                except Exception:
+                    pass
+                info = inspect_homework_window(handle)
             except Exception as exc:  # noqa: BLE001
                 info = {"ok": False, "message": str(exc)}
             self.events.put(("inspect", (token, info)))
@@ -722,6 +793,26 @@ class App(tk.Tk):
                 numbers.add(int(part))
         return numbers
 
+    def _has_page_text(self) -> bool:
+        if self.question_platform == "zhihuishu":
+            return zhihuishu.PAGE_TEXT.exists() or PAGE_TEXT.exists()
+        return PAGE_TEXT.exists()
+
+    def _resolve_platform(self, item: dict | None = None) -> str:
+        """按当前窗口决定平台，避免重启后仍走超星写入路径。"""
+        item = item or self.selected_window()
+        platform = ""
+        if item:
+            platform = str(item.get("platform") or "")
+            if not platform:
+                platform = detect_platform(item.get("title") or "")
+        if not platform:
+            platform = self.question_platform or "chaoxing"
+        if platform not in {"chaoxing", "zhihuishu"}:
+            platform = "chaoxing"
+        self.question_platform = platform
+        return platform
+
     def read_clipboard(self) -> None:
         try:
             text = self.clipboard_get()
@@ -730,7 +821,13 @@ class App(tk.Tk):
             return
         PAGE_TEXT.write_text(text, encoding="utf-8")
         try:
-            questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
+            if "【单选题】" in text or "【多选题】" in text or "【判断题】" in text:
+                self.question_platform = "zhihuishu"
+                zhihuishu.PAGE_TEXT.write_text(text, encoding="utf-8")
+                questions, skipped = zhihuishu.parse_questions(text)
+            else:
+                self.question_platform = "chaoxing"
+                questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("题目解析失败", str(exc))
             return
@@ -743,7 +840,7 @@ class App(tk.Tk):
         self.question_work_id = self.detected_work_id
         self.question_name = self.detected_name or "剪贴板"
         self._refresh_question_banner()
-        self.write_log(f"已从剪贴板解析 {len(questions)} 题，保存在 _page_text.txt")
+        self.write_log(f"已从剪贴板解析 {len(questions)} 题（{self.question_platform}）")
         note = describe_skipped(skipped)
         if note:
             self.write_log(note)
@@ -752,6 +849,17 @@ class App(tk.Tk):
         if not ANSWERS_PATH.exists():
             return
         self.records = json.loads(ANSWERS_PATH.read_text(encoding="utf-8"))
+        # 重启后根据已保存题目文本恢复平台，避免写入误走超星
+        for path in (zhihuishu.PAGE_TEXT, PAGE_TEXT):
+            if not path.exists():
+                continue
+            try:
+                sample = path.read_text(encoding="utf-8")[:800]
+            except Exception:
+                continue
+            if "【单选题】" in sample or "【多选题】" in sample or "【判断题】" in sample:
+                self.question_platform = "zhihuishu"
+                break
         self._fill_tree()
 
     def _fill_tree(self, diff_nos: set[int] | None = None) -> None:
@@ -775,6 +883,12 @@ class App(tk.Tk):
                 values=(record["no"], TYPE_LABEL.get(record["type"], record["type"]), show_answer(record.get("answer", "")), stem[:80]),
             )
 
+    def _parse_current_questions(self):
+        if self.question_platform == "zhihuishu":
+            path = zhihuishu.PAGE_TEXT if zhihuishu.PAGE_TEXT.exists() else PAGE_TEXT
+            return zhihuishu.parse_questions(path.read_text(encoding="utf-8"))
+        return parse_questions(load_page_text(PAGE_TEXT))
+
     def update_questions(self) -> None:
         item = self.selected_window()
         if not item:
@@ -785,14 +899,24 @@ class App(tk.Tk):
             info = inspect_homework_window(item["handle"], flash=False)
             if not info.get("ok"):
                 raise SystemExit(info.get("message") or "没有读到当前窗口")
-            text = copy_page_text(item["handle"])
+            platform = info.get("platform") or item.get("platform") or "chaoxing"
+            self.question_platform = platform
+            text = copy_page_text(
+                item["handle"],
+                log=lambda message: self.events.put(("log", message)),
+            )
             PAGE_TEXT.write_text(text, encoding="utf-8")
-            questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
-            try:
-                images = save_question_images(item["handle"], questions)
-            except Exception as exc:  # noqa: BLE001
+            if platform == "zhihuishu":
+                zhihuishu.PAGE_TEXT.write_text(text, encoding="utf-8")
+                questions, skipped = zhihuishu.parse_questions(text)
                 images = {}
-                self.events.put(("log", f"图片截取失败：{exc}"))
+            else:
+                questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
+                try:
+                    images = save_question_images(item["handle"], questions)
+                except Exception as exc:  # noqa: BLE001
+                    images = {}
+                    self.events.put(("log", f"图片截取失败：{exc}"))
             self.records = [
                 {
                     "no": question["no"],
@@ -811,7 +935,10 @@ class App(tk.Tk):
             self.detected_name = self.question_name
             self.events.put(("tree", None))
             self.events.put(("banner", None))
-            self.events.put(("log", f"已更新题目：{self.question_name or '当前作业'}，共 {len(questions)} 题"))
+            plat_name = "智慧树" if platform == "zhihuishu" else "超星"
+            self.events.put(
+                ("log", f"已更新题目（{plat_name}）：{self.question_name or '当前作业'}，共 {len(questions)} 题")
+            )
             pictured = [number for number, paths in images.items() if paths]
             if pictured:
                 numbers = "、".join(str(number) for number in pictured)
@@ -855,7 +982,7 @@ class App(tk.Tk):
         if not self._questions_match_window():
             messagebox.showwarning("题目不是当前页面", "请先选中作业窗口并点「更新题目」。生成答案会使用更新后的题目，不会沿用上次保存的旧题。")
             return
-        if not PAGE_TEXT.exists():
+        if not self._has_page_text():
             messagebox.showwarning("还没有题目", "请先点「更新题目」")
             return
         config = self.current_config()
@@ -864,7 +991,7 @@ class App(tk.Tk):
             return
 
         def work() -> None:
-            questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
+            questions, skipped = self._parse_current_questions()
             note = describe_skipped(skipped)
             if note:
                 self.events.put(("log", note))
@@ -882,7 +1009,7 @@ class App(tk.Tk):
         if not self.records or not any(record.get("answer") for record in self.records):
             messagebox.showwarning("还没有答案", "请先生成答案，再点「AI验证」")
             return
-        if not PAGE_TEXT.exists():
+        if not self._has_page_text():
             messagebox.showwarning("还没有题目", "请先点「更新题目」")
             return
         config = self.verify_config()
@@ -910,7 +1037,7 @@ class App(tk.Tk):
             return
 
         def work() -> None:
-            questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
+            questions, skipped = self._parse_current_questions()
             note = describe_skipped(skipped)
             if note:
                 self.events.put(("log", note))
@@ -970,7 +1097,7 @@ class App(tk.Tk):
         if record is None:
             messagebox.showwarning("未选中题目", "请先在列表里点选一道题，再点「重新生成本题」")
             return
-        if not PAGE_TEXT.exists():
+        if not self._has_page_text():
             messagebox.showwarning("还没有题目", "请先点「更新题目」")
             return
         config = self.current_config()
@@ -989,7 +1116,7 @@ class App(tk.Tk):
         number = record["no"]
 
         def work() -> None:
-            questions, skipped = parse_questions(load_page_text(PAGE_TEXT))
+            questions, skipped = self._parse_current_questions()
             note = describe_skipped(skipped)
             if note:
                 self.events.put(("log", note))
@@ -1043,9 +1170,12 @@ class App(tk.Tk):
             messagebox.showwarning("题号格式不正确", "示例：71-80 或 96 97")
             return
         records = json.loads(json.dumps(self.records, ensure_ascii=False))
+        platform = self._resolve_platform(item)
 
         def work() -> None:
-            apply_answers(
+            writer = zhihuishu.apply_answers if platform == "zhihuishu" else apply_answers
+            self.events.put(("log", f"按「{'智慧树' if platform == 'zhihuishu' else '超星'}」方式写入"))
+            writer(
                 records,
                 only,
                 window_title=item["title"],
@@ -1071,12 +1201,14 @@ class App(tk.Tk):
             return
         records = [record for record in self.records if not only or record["no"] in only]
         scope = "全部题目" if not only else "指定题号"
+        platform = self._resolve_platform(item)
 
         def work() -> None:
             choice_count = sum(1 for record in records if record["type"] not in {"blank", "essay"})
             blank_count = sum(1 for record in records if record["type"] == "blank")
             essay_count = sum(1 for record in records if record["type"] == "essay")
-            mismatches = verify_answers(records, window_title=item["title"], window_handle=item["handle"], only=only)
+            checker = zhihuishu.verify_answers if platform == "zhihuishu" else verify_answers
+            mismatches = checker(records, window_title=item["title"], window_handle=item["handle"], only=only)
             if blank_count:
                 self.events.put(("log", f"填空题 {blank_count} 题没有核对：页面上读不到已经填入的内容"))
             if essay_count:
@@ -1149,6 +1281,9 @@ class App(tk.Tk):
                 self._apply_regenerated(payload or {})
             elif kind == "banner":
                 self._refresh_question_banner()
+            elif kind == "refresh":
+                token, windows, error = payload
+                self._apply_refresh(token, windows or [], error or "")
             elif kind == "inspect":
                 token, info = payload
                 if token == self._inspect_token:
@@ -1158,7 +1293,15 @@ class App(tk.Tk):
                     if info.get("ok"):
                         self.detected_work_id = info.get("work_id") or ""
                         self.detected_name = info.get("name") or ""
+                        item = self.selected_window()
+                        if item is not None and info.get("platform"):
+                            item["platform"] = info["platform"]
+                        if info.get("platform"):
+                            self.question_platform = info["platform"]
                         self._refresh_question_banner()
+                    if not self._refreshing and not (self.worker and self.worker.is_alive()):
+                        self.detect_button.configure(state="normal")
+                        self.refresh_button.configure(state="normal")
             elif kind == "idle":
                 self._set_busy(False)
                 self.footer_text.configure(text="就绪")
@@ -1176,8 +1319,8 @@ class DiffChoiceDialog(tk.Toplevel):
         self.grab_set()
         self.result: dict[int, str] | None = None
         self._vars: dict[int, tk.StringVar] = {}
-        self.geometry("760x560")
-        self.minsize(640, 420)
+        self.geometry("880x640")
+        self.minsize(720, 480)
 
         header = tk.Frame(self, bg=SIDEBAR, highlightbackground=SIDEBAR_LINE, highlightthickness=1)
         header.pack(fill="x")
@@ -1215,36 +1358,38 @@ class DiffChoiceDialog(tk.Toplevel):
         body.bind("<Configure>", _resize)
         canvas.bind("<Configure>", _resize)
 
+        def _on_mousewheel(event) -> None:
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
         for item in diffs:
             card = tk.Frame(body, bg=CARD, padx=12, pady=10, highlightbackground=LINE, highlightthickness=1)
             card.pack(fill="x", pady=5)
             title = f"第 {item['no']} 题 · {TYPE_LABEL.get(item['type'], item['type'])}"
             tk.Label(card, text=title, bg=CARD, fg=ACCENT_DEEP, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
             stem = " ".join((item.get("stem") or "").split())
-            tk.Label(
+            stem_label = tk.Label(
                 card,
-                text=stem[:160] + ("…" if len(stem) > 160 else ""),
+                text=stem,
                 bg=CARD,
                 fg=MUTED,
-                wraplength=680,
+                wraplength=780,
                 justify="left",
                 anchor="w",
                 font=("Microsoft YaHei UI", 9),
-            ).pack(fill="x", pady=6)
+            )
+            stem_label.pack(fill="x", pady=6)
             choice = tk.StringVar(value="original")
             self._vars[item["no"]] = choice
-            ttk.Radiobutton(
-                card,
-                text=f"保留原答案：{show_answer(item.get('original'))}",
-                variable=choice,
-                value="original",
-            ).pack(anchor="w")
-            ttk.Radiobutton(
-                card,
-                text=f"采用验证答案：{show_answer(item.get('reviewed'))}",
-                variable=choice,
-                value="reviewed",
-            ).pack(anchor="w", pady=2)
+            self._add_answer_choice(card, choice, "original", "保留原答案", show_answer(item.get("original")))
+            self._add_answer_choice(card, choice, "reviewed", "采用验证答案", show_answer(item.get("reviewed")))
+
+            def _sync_wrap(event, label=stem_label) -> None:
+                label.configure(wraplength=max(event.width - 24, 320))
+
+            card.bind("<Configure>", _sync_wrap)
 
         actions = tk.Frame(self, bg=BG)
         actions.pack(fill="x", padx=12, pady=12)
@@ -1253,7 +1398,42 @@ class DiffChoiceDialog(tk.Toplevel):
         ttk.Button(actions, text="取消", command=self._cancel).pack(side="right")
         ttk.Button(actions, text="确认选用", style="Primary.TButton", command=self._confirm).pack(side="right", padx=(0, 8))
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        def _cleanup() -> None:
+            try:
+                canvas.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
+
+        self.bind("<Destroy>", lambda _e: _cleanup())
         self.wait_window(self)
+
+    def _add_answer_choice(self, parent: tk.Misc, variable: tk.StringVar, value: str, title: str, answer: str) -> None:
+        block = tk.Frame(parent, bg=CARD)
+        block.pack(fill="x", pady=4)
+        ttk.Radiobutton(block, text=title, variable=variable, value=value).pack(anchor="w")
+        box = tk.Frame(block, bg=CARD)
+        box.pack(fill="x", pady=(4, 0))
+        lines = max(3, min(12, answer.count("\n") + max(len(answer), 1) // 36 + 1))
+        text = tk.Text(
+            box,
+            wrap="word",
+            height=lines,
+            bg="#F8FAFC",
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 10),
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+            padx=8,
+            pady=6,
+        )
+        bar = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=bar.set)
+        text.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        text.insert("1.0", answer or "（空）")
+        text.configure(state="disabled")
 
     def _keep_all(self) -> None:
         for var in self._vars.values():
